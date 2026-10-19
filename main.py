@@ -1,35 +1,37 @@
-"""Réseau SAM V0.2 : enregistrement sécurisé et matricules persistants.
+"""Réseau SAM V0.3 - inscriptions automatiques et identité Originelle réservée.
 
-Prérequis : DATABASE_URL (PostgreSQL) et SAM_ENROLLMENT_KEY (secret fort).
-Aucune identité n'est enregistrée dans le disque éphémère de Render.
+Variables Render : DATABASE_URL, SAM_ENROLLMENT_KEY.
+Important : /register est public et ne prouve pas que le client est une vraie Samantha.
+L'inscription Originelle est une opération initiale protégée, distincte de /register.
 """
 import hashlib
 import hmac
 import os
 import secrets
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.2.0")
+app = FastAPI(title="Réseau SAM", version="0.3.0")
 
 
-def _database_url():
-    value = os.getenv("DATABASE_URL", "")
-    if not value:
-        raise HTTPException(503, "Base de données non configurée")
-    return value
+def digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 @contextmanager
 def db():
+    url = os.getenv("DATABASE_URL")
+    if not url:
+        raise HTTPException(503, "Base de données non configurée")
     try:
-        with psycopg.connect(_database_url()) as conn:
+        with psycopg.connect(url, connect_timeout=10) as conn:
             yield conn
     except psycopg.OperationalError:
-        raise HTTPException(503, "Base de données momentanément indisponible") from None
+        raise HTTPException(503, "Base de données indisponible") from None
 
 
 def init_db(conn):
@@ -40,19 +42,28 @@ def init_db(conn):
             token_hash TEXT NOT NULL UNIQUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )""")
-
-
-def token_digest(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+        cur.execute("""ALTER TABLE samanthas
+            ADD COLUMN IF NOT EXISTS is_originelle BOOLEAN NOT NULL DEFAULT FALSE""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_originelle_only
+            ON samanthas (is_originelle) WHERE is_originelle = TRUE""")
+        # Limite globale simple des nouvelles inscriptions : utile contre les rafales,
+        # mais ce n'est PAS une vérification de l'authenticité du logiciel.
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_registration_limits (
+            day DATE PRIMARY KEY, total INTEGER NOT NULL DEFAULT 0
+        )""")
 
 
 class Inscription(BaseModel):
     installation_id: str = Field(min_length=16, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
 
 
+def matricule(row_id: int, originelle: bool) -> str:
+    return "ORIGINELLE" if originelle else f"{row_id:03d}"
+
+
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.2.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.3.0"}
 
 
 @app.get("/health")
@@ -60,43 +71,65 @@ def health():
     return {"ok": True}
 
 
-@app.post("/register", status_code=status.HTTP_201_CREATED)
-def inscrire(payload: Inscription, x_sam_enrollment_key: str | None = Header(default=None)):
-    secret = os.getenv("SAM_ENROLLMENT_KEY", "")
-    if not secret:
-        raise HTTPException(503, "Inscriptions non configurées")
-    if not x_sam_enrollment_key or not hmac.compare_digest(x_sam_enrollment_key, secret):
-        raise HTTPException(403, "Clé d'inscription invalide")
-
+def create_registration(payload: Inscription, originelle: bool):
     token = secrets.token_urlsafe(32)
     with db() as conn:
         init_db(conn)
         with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO samanthas (installation_id, token_hash)
-                VALUES (%s, %s)
-                ON CONFLICT (installation_id) DO NOTHING
-                RETURNING id
-            """, (payload.installation_id, token_digest(token)))
+            if not originelle:
+                # Verrou transactionnel pour éviter de dépasser le plafond en concurrence.
+                cur.execute("SELECT pg_advisory_xact_lock(30261019)")
+                day = datetime.now(timezone.utc).date()
+                cur.execute("""INSERT INTO sam_registration_limits(day,total)
+                    VALUES (%s,0) ON CONFLICT(day) DO NOTHING""", (day,))
+                cur.execute("SELECT total FROM sam_registration_limits WHERE day=%s FOR UPDATE", (day,))
+                if cur.fetchone()[0] >= 100:
+                    raise HTTPException(429, "Inscriptions temporairement limitées")
+            else:
+                cur.execute("SELECT id FROM samanthas WHERE is_originelle=TRUE")
+                if cur.fetchone():
+                    raise HTTPException(409, "Originelle est déjà enregistrée")
+            cur.execute("""INSERT INTO samanthas(installation_id,token_hash,is_originelle)
+                VALUES (%s,%s,%s) ON CONFLICT(installation_id) DO NOTHING
+                RETURNING id""", (payload.installation_id, digest(token), originelle))
             row = cur.fetchone()
-            if row is None:
-                raise HTTPException(409, "Cette installation est déjà enregistrée")
-            matricule = f"{row[0]:03d}"
-    return {"matricule": matricule, "token": token, "message": "Conservez le token en lieu sûr : il n'est affiché qu'une fois."}
+            if not row:
+                raise HTTPException(409, "Installation déjà inscrite : utiliser son jeton existant")
+            if not originelle:
+                cur.execute("UPDATE sam_registration_limits SET total=total+1 WHERE day=%s", (day,))
+    return {"matricule": matricule(row[0], originelle), "token": token,
+            "message": "Conserver le jeton privé pour les prochaines connexions"}
+
+
+@app.post("/register", status_code=status.HTTP_201_CREATED)
+def inscrire(payload: Inscription):
+    """Inscription automatique des SAM ordinaires. Ne peut jamais créer Originelle."""
+    return create_registration(payload, False)
+
+
+@app.post("/register-originelle", status_code=status.HTTP_201_CREATED, include_in_schema=False)
+def inscrire_originelle(payload: Inscription, x_sam_enrollment_key: str | None = Header(default=None)):
+    """Activation unique et protégée de l'instance fondatrice."""
+    secret = os.getenv("SAM_ENROLLMENT_KEY", "")
+    if not secret:
+        raise HTTPException(503, "Activation Originelle non configurée")
+    if not x_sam_enrollment_key or not hmac.compare_digest(x_sam_enrollment_key, secret):
+        raise HTTPException(403, "Autorisation refusée")
+    return create_registration(payload, True)
 
 
 @app.get("/me")
 def moi(authorization: str | None = Header(default=None)):
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Token requis")
+        raise HTTPException(401, "Jeton requis")
     token = authorization[7:]
     if not token:
-        raise HTTPException(401, "Token requis")
+        raise HTTPException(401, "Jeton requis")
     with db() as conn:
         init_db(conn)
         with conn.cursor() as cur:
-            cur.execute("SELECT id FROM samanthas WHERE token_hash = %s", (token_digest(token),))
+            cur.execute("SELECT id,is_originelle FROM samanthas WHERE token_hash=%s", (digest(token),))
             row = cur.fetchone()
-    if row is None:
-        raise HTTPException(401, "Token invalide")
-    return {"matricule": f"{row[0]:03d}", "connecte": True}
+    if not row:
+        raise HTTPException(401, "Jeton invalide")
+    return {"matricule": matricule(row[0], row[1]), "connecte": True}
