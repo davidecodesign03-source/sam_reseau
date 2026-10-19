@@ -6,6 +6,7 @@ L'inscription Originelle est une opération initiale protégée, distincte de /r
 """
 import hashlib
 import hmac
+import logging
 import os
 import secrets
 from contextlib import contextmanager
@@ -16,6 +17,7 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="Réseau SAM", version="0.3.0")
+logger = logging.getLogger("uvicorn.error")
 
 
 def digest(value: str) -> str:
@@ -30,7 +32,27 @@ def db():
     try:
         with psycopg.connect(url, connect_timeout=10) as conn:
             yield conn
-    except psycopg.OperationalError:
+    except psycopg.OperationalError as exc:
+        # Diagnostic sans afficher de chaîne de connexion, de jeton ou de mot de passe.
+        detail = str(exc).lower()
+        if "password authentication failed" in detail or "authentication failed" in detail:
+            reason = "authentication_failed"
+        elif "tenant or user not found" in detail:
+            reason = "pooler_user_not_found"
+        elif "could not translate host name" in detail or "name or service not known" in detail:
+            reason = "dns_resolution"
+        elif "timeout" in detail or "timed out" in detail:
+            reason = "connection_timeout"
+        elif "connection refused" in detail:
+            reason = "connection_refused"
+        elif "network is unreachable" in detail:
+            reason = "network_unreachable"
+        elif "no pg_hba.conf entry" in detail:
+            reason = "pg_hba_rejected"
+        else:
+            reason = "other_operational_error"
+        logger.error("SAM_DATABASE_CONNECTION_FAILURE category=%s sqlstate=%s",
+                     reason, getattr(exc, "sqlstate", None))
         raise HTTPException(503, "Base de données indisponible") from None
 
 
