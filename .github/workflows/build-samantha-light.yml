@@ -22,6 +22,8 @@ jobs:
       - name: Extraire Samantha Light
         shell: pwsh
         run: |
+          Write-Host 'Verification des fichiers du depot :'
+          Get-ChildItem -Force | Select-Object Name | Format-Table
           if (-not (Test-Path 'samantha-light-source.zip')) {
             throw "Il manque samantha-light-source.zip a la racine du depot."
           }
