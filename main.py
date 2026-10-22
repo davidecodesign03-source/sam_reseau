@@ -85,7 +85,7 @@ def matricule(row_id: int, originelle: bool) -> str:
 
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.5.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.6.0"}
 
 
 @app.get("/health")
@@ -396,8 +396,18 @@ def contacts_en_ligne(authorization: str | None = Header(default=None)):
         with conn.cursor() as cur:
             cur.execute("""SELECT s.id,s.is_originelle FROM sam_presence p
                            JOIN samanthas s ON s.id=p.sam_id
-                           WHERE p.sam_id<>%s AND p.last_seen > now()-interval '90 seconds'
+                           WHERE p.sam_id<>%s AND p.last_seen > now()-interval '30 seconds'
                            ORDER BY s.is_originelle DESC,s.id ASC LIMIT 100""", (my_id,))
             rows = cur.fetchall()
     return {"contacts": [{"matricule": matricule(r[0],r[1]), "en_ligne": True}
                          for r in rows]}
+
+
+@app.post("/presence/deconnexion")
+def quitter_reseau(authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_presence(conn)
+        my_id, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM sam_presence WHERE sam_id=%s", (my_id,))
+    return {"en_ligne": False}
