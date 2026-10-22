@@ -40,7 +40,7 @@ jobs:
       - name: Compiler le programme Windows
         shell: pwsh
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Samantha_Light --distpath dist --workpath build --specpath build `
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Samantha_Light --distpath dist --workpath build `
             --add-data "source/demande_001.mp3;." `
             --add-data "source/presentation_001.mp3;." `
             --add-data "source/fin_001.mp3;." `
