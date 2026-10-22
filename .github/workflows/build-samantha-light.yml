@@ -1,0 +1,64 @@
+name: Compiler Samantha Light pour Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'samantha-light-source.zip'
+      - '.github/workflows/build-samantha-light.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Extraire Samantha Light
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'samantha-light-source.zip')) {
+            throw "Il manque samantha-light-source.zip a la racine du depot."
+          }
+          New-Item -ItemType Directory -Force -Path source | Out-Null
+          Expand-Archive -Path samantha-light-source.zip -DestinationPath source -Force
+          $script = Get-ChildItem source -Recurse -Filter 'Samantha_002_Light_V1_3_Reconnaissance_Vocale.py' | Select-Object -First 1
+          if (-not $script) { throw "Programme Samantha Light introuvable dans le ZIP." }
+          Copy-Item (Join-Path $script.DirectoryName '*') -Destination source -Recurse -Force -ErrorAction SilentlyContinue
+          @('demande_001.mp3','presentation_001.mp3','fin_001.mp3','sonar_sam_rotation.wav','sam_002_emission_radio.mp3') | ForEach-Object {
+            if (-not (Test-Path (Join-Path source $_))) { throw "Fichier sonore manquant: $_" }
+          }
+      - name: Installer PyInstaller
+        run: python -m pip install --upgrade pyinstaller
+      - name: Compiler le programme Windows
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Samantha_Light --distpath dist --workpath build --specpath build `
+            --add-data "source/demande_001.mp3;." `
+            --add-data "source/presentation_001.mp3;." `
+            --add-data "source/fin_001.mp3;." `
+            --add-data "source/sonar_sam_rotation.wav;." `
+            --add-data "source/sam_002_emission_radio.mp3;." `
+            source/Samantha_002_Light_V1_3_Reconnaissance_Vocale.py
+          if (-not (Test-Path dist/Samantha_Light/Samantha_Light.exe)) { throw "EXE non cree" }
+      - name: Test basique de lancement
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path dist/Samantha_Light/Samantha_Light.exe).Path
+          $proc = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+          if ($proc.HasExited -and $proc.ExitCode -ne 0) { throw "Lancement impossible : code $($proc.ExitCode)" }
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+      - name: Creer ZIP partageable
+        shell: pwsh
+        run: Compress-Archive -Path dist/Samantha_Light -DestinationPath Samantha_Light_Windows.zip -Force
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Samantha_Light_Windows
+          path: Samantha_Light_Windows.zip
+          retention-days: 7
