@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.4.0")
+app = FastAPI(title="Réseau SAM", version="0.5.0")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -85,7 +85,7 @@ def matricule(row_id: int, originelle: bool) -> str:
 
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.4.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.5.0"}
 
 
 @app.get("/health")
@@ -364,4 +364,40 @@ def recevoir_messages(liaison_id: int, apres: int = Query(default=0, ge=0),
             rows = cur.fetchall()
         labels = labels_for(conn, {r[1] for r in rows})
     return {"messages": [{"message_id": r[0], "auteur": labels[r[1]], "texte": r[2]}
+                         for r in rows]}
+
+
+# --- V0.5 : présence réelle des Samantha (heartbeat, expiration automatique) ---
+from datetime import timedelta
+
+def init_presence(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_presence (
+            sam_id BIGINT PRIMARY KEY REFERENCES samanthas(id) ON DELETE CASCADE,
+            last_seen TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+@app.post("/presence")
+def signaler_presence(authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_presence(conn)
+        my_id, my_label = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sam_presence(sam_id,last_seen)
+                           VALUES (%s,now()) ON CONFLICT(sam_id)
+                           DO UPDATE SET last_seen=now()""", (my_id,))
+    return {"matricule": my_label, "en_ligne": True}
+
+@app.get("/contacts")
+def contacts_en_ligne(authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_presence(conn)
+        my_id, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT s.id,s.is_originelle FROM sam_presence p
+                           JOIN samanthas s ON s.id=p.sam_id
+                           WHERE p.sam_id<>%s AND p.last_seen > now()-interval '90 seconds'
+                           ORDER BY s.is_originelle DESC,s.id ASC LIMIT 100""", (my_id,))
+            rows = cur.fetchall()
+    return {"contacts": [{"matricule": matricule(r[0],r[1]), "en_ligne": True}
                          for r in rows]}
