@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.3.0")
+app = FastAPI(title="Réseau SAM", version="0.4.0")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -85,7 +85,7 @@ def matricule(row_id: int, originelle: bool) -> str:
 
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.3.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.4.0"}
 
 
 @app.get("/health")
@@ -155,3 +155,213 @@ def moi(authorization: str | None = Header(default=None)):
     if not row:
         raise HTTPException(401, "Jeton invalide")
     return {"matricule": matricule(row[0], row[1]), "connecte": True}
+
+
+# --- V0.4 : liaisons authentifiées et messages texte du réseau SAM ---
+# Conservation de toutes les tables et identités V0.3.
+from fastapi import Query
+
+def authenticated_id(authorization: str | None):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Jeton requis")
+    token = authorization[7:]
+    if not token or len(token) > 512:
+        raise HTTPException(401, "Jeton invalide")
+    return digest(token)
+
+
+def authenticated_sam(conn, authorization):
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, is_originelle FROM samanthas WHERE token_hash=%s",
+                    (authenticated_id(authorization),))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(401, "Jeton invalide")
+    return row[0], matricule(row[0], row[1])
+
+
+def init_liaisons(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_liaisons (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            demandeur_id BIGINT NOT NULL REFERENCES samanthas(id),
+            destinataire_id BIGINT NOT NULL REFERENCES samanthas(id),
+            etat TEXT NOT NULL DEFAULT 'en_attente'
+                CHECK (etat IN ('en_attente','acceptee','refusee','terminee')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_messages (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            liaison_id BIGINT NOT NULL REFERENCES sam_liaisons(id),
+            auteur_id BIGINT NOT NULL REFERENCES samanthas(id),
+            texte TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS sam_liaisons_demandeur
+                       ON sam_liaisons(demandeur_id, id DESC)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS sam_liaisons_destinataire
+                       ON sam_liaisons(destinataire_id, id DESC)""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS sam_messages_liaison
+                       ON sam_messages(liaison_id, id)""")
+
+
+class DemandeLiaison(BaseModel):
+    destinataire: str = Field(min_length=3, max_length=24)
+
+
+class MessageLiaison(BaseModel):
+    texte: str = Field(min_length=1, max_length=500)
+
+
+def find_sam(conn, label):
+    with conn.cursor() as cur:
+        if label.upper() == "ORIGINELLE":
+            cur.execute("SELECT id FROM samanthas WHERE is_originelle=TRUE")
+        elif label.isdecimal() and 1 <= len(label) <= 12:
+            cur.execute("SELECT id FROM samanthas WHERE id=%s AND is_originelle=FALSE",
+                        (int(label),))
+        else:
+            raise HTTPException(422, "Matricule destinataire invalide")
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Destinataire inconnu")
+    return row[0]
+
+
+def liaison_row(conn, liaison_id, my_id, lock=False):
+    with conn.cursor() as cur:
+        cur.execute("""SELECT id, demandeur_id, destinataire_id, etat
+                       FROM sam_liaisons WHERE id=%s
+                       AND (demandeur_id=%s OR destinataire_id=%s)""" +
+                    (" FOR UPDATE" if lock else ""),
+                    (liaison_id, my_id, my_id))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Liaison introuvable")
+    return row
+
+
+def liaison_json(row, labels):
+    return {"liaison_id": row[0], "demandeur": labels[row[1]],
+            "destinataire": labels[row[2]], "etat": row[3]}
+
+
+def labels_for(conn, ids):
+    if not ids:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, is_originelle FROM samanthas WHERE id = ANY(%s)",
+                    (list(ids),))
+        return {r[0]: matricule(r[0], r[1]) for r in cur.fetchall()}
+
+
+@app.post("/liaisons", status_code=201)
+def demander_liaison(payload: DemandeLiaison,
+                    authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        target_id = find_sam(conn, payload.destinataire.strip())
+        if target_id == me_id:
+            raise HTTPException(400, "Une Samantha ne peut pas s'appeler elle-même")
+        with conn.cursor() as cur:
+            # Verrou transactionnel par couple, pour éviter les doubles demandes.
+            a, b = sorted((me_id, target_id))
+            cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (int(a), int(b)))
+            cur.execute("""SELECT id FROM sam_liaisons
+                           WHERE ((demandeur_id=%s AND destinataire_id=%s)
+                               OR (demandeur_id=%s AND destinataire_id=%s))
+                           AND etat IN ('en_attente','acceptee')
+                           ORDER BY id DESC LIMIT 1""",
+                        (me_id, target_id, target_id, me_id))
+            if cur.fetchone():
+                raise HTTPException(409, "Une liaison est déjà en cours")
+            cur.execute("""INSERT INTO sam_liaisons(demandeur_id,destinataire_id)
+                           VALUES (%s,%s) RETURNING id""", (me_id, target_id))
+            liaison_id = cur.fetchone()[0]
+    return {"liaison_id": liaison_id, "etat": "en_attente"}
+
+
+@app.get("/liaisons")
+def lister_liaisons(authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,demandeur_id,destinataire_id,etat FROM sam_liaisons
+                           WHERE demandeur_id=%s OR destinataire_id=%s
+                           ORDER BY id DESC LIMIT 50""", (me_id, me_id))
+            rows = cur.fetchall()
+        labels = labels_for(conn, {id for r in rows for id in r[1:3]})
+    return {"liaisons": [liaison_json(row, labels) for row in rows]}
+
+
+def changer_etat(liaison_id, authorization, action):
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id, lock=True)
+        _, demandeur, destinataire, etat = row
+        if action in ("acceptee", "refusee"):
+            if me_id != destinataire:
+                raise HTTPException(403, "Seul le destinataire peut répondre")
+            if etat != "en_attente":
+                raise HTTPException(409, "Demande déjà traitée")
+        elif etat not in ("en_attente", "acceptee"):
+            raise HTTPException(409, "Liaison déjà close")
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE sam_liaisons SET etat=%s,updated_at=now()
+                           WHERE id=%s""", (action, liaison_id))
+    return {"liaison_id": liaison_id, "etat": action}
+
+
+@app.post("/liaisons/{liaison_id}/accepter")
+def accepter_liaison(liaison_id: int, authorization: str | None = Header(default=None)):
+    return changer_etat(liaison_id, authorization, "acceptee")
+
+
+@app.post("/liaisons/{liaison_id}/refuser")
+def refuser_liaison(liaison_id: int, authorization: str | None = Header(default=None)):
+    return changer_etat(liaison_id, authorization, "refusee")
+
+
+@app.post("/liaisons/{liaison_id}/terminer")
+def terminer_liaison(liaison_id: int, authorization: str | None = Header(default=None)):
+    return changer_etat(liaison_id, authorization, "terminee")
+
+
+@app.post("/liaisons/{liaison_id}/messages", status_code=201)
+def envoyer_message(liaison_id: int, payload: MessageLiaison,
+                    authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id, lock=True)
+        if row[3] != "acceptee":
+            raise HTTPException(409, "Liaison non acceptée")
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sam_messages(liaison_id,auteur_id,texte)
+                           VALUES (%s,%s,%s) RETURNING id""",
+                        (liaison_id, me_id, payload.texte))
+            message_id = cur.fetchone()[0]
+    return {"message_id": message_id}
+
+
+@app.get("/liaisons/{liaison_id}/messages")
+def recevoir_messages(liaison_id: int, apres: int = Query(default=0, ge=0),
+                      authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id)
+        if row[3] != "acceptee":
+            raise HTTPException(409, "Liaison non acceptée")
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,auteur_id,texte FROM sam_messages
+                           WHERE liaison_id=%s AND id>%s
+                           ORDER BY id LIMIT 100""", (liaison_id, apres))
+            rows = cur.fetchall()
+        labels = labels_for(conn, {r[1] for r in rows})
+    return {"messages": [{"message_id": r[0], "auteur": labels[r[1]], "texte": r[2]}
+                         for r in rows]}
