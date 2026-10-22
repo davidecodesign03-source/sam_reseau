@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.5.0")
+app = FastAPI(title="Réseau SAM", version="0.7.0")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -85,7 +85,7 @@ def matricule(row_id: int, originelle: bool) -> str:
 
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.6.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.7.0"}
 
 
 @app.get("/health")
@@ -411,3 +411,69 @@ def quitter_reseau(authorization: str | None = Header(default=None)):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sam_presence WHERE sam_id=%s", (my_id,))
     return {"en_ligne": False}
+
+
+# --- V0.7 : audio différé, une transmission à la fois ---
+# Le contenu MP3 est stocké dans PostgreSQL pour survivre aux redémarrages Render.
+import base64
+import binascii
+
+class AudioTransmission(BaseModel):
+    audio_b64: str = Field(min_length=1, max_length=2100000)
+    nom: str = Field(default="transmission.mp3", max_length=100)
+
+def init_audio(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_audio_transmissions (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            liaison_id BIGINT NOT NULL REFERENCES sam_liaisons(id) ON DELETE CASCADE,
+            auteur_id BIGINT NOT NULL REFERENCES samanthas(id),
+            audio BYTEA NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+@app.post("/liaisons/{liaison_id}/audio", status_code=201)
+def envoyer_audio(liaison_id: int, payload: AudioTransmission,
+                  authorization: str | None = Header(default=None)):
+    try:
+        audio = base64.b64decode(payload.audio_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Audio base64 invalide")
+    if not (100 <= len(audio) <= 1500000):
+        raise HTTPException(413, "Audio trop volumineux ou vide (1,5 Mo maximum)")
+    if not audio.startswith(b"ID3") and audio[:2] not in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        raise HTTPException(415, "MP3 attendu")
+    with db() as conn:
+        init_liaisons(conn)
+        init_audio(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id, lock=True)
+        if row[3] != "acceptee":
+            raise HTTPException(409, "Liaison non acceptée")
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sam_audio_transmissions(liaison_id,auteur_id,audio)
+                           VALUES (%s,%s,%s) RETURNING id""",
+                        (liaison_id, me_id, audio))
+            transmission_id = cur.fetchone()[0]
+    return {"transmission_id": transmission_id}
+
+@app.get("/liaisons/{liaison_id}/audio")
+def recevoir_audio(liaison_id: int, apres: int = Query(default=0, ge=0),
+                   authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_liaisons(conn)
+        init_audio(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id)
+        if row[3] != "acceptee":
+            raise HTTPException(409, "Liaison non acceptée")
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,auteur_id,audio FROM sam_audio_transmissions
+                           WHERE liaison_id=%s AND id>%s ORDER BY id LIMIT 4""",
+                        (liaison_id, apres))
+            rows = cur.fetchall()
+        labels = labels_for(conn, {r[1] for r in rows})
+    return {"transmissions": [
+        {"transmission_id": r[0], "auteur": labels[r[1]],
+         "audio_b64": base64.b64encode(bytes(r[2])).decode("ascii")}
+        for r in rows]}
