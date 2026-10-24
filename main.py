@@ -477,3 +477,63 @@ def recevoir_audio(liaison_id: int, apres: int = Query(default=0, ge=0),
         {"transmission_id": r[0], "auteur": labels[r[1]],
          "audio_b64": base64.b64encode(bytes(r[2])).decode("ascii")}
         for r in rows]}
+
+# --- V0.8 (préparation) : informations partagées uniquement entre contacts autorisés ---
+# Les préférences de confidentialité sont transmises par le client et
+# les données non autorisées sont effacées côté serveur.
+from typing import Optional
+
+class SamSharedStatus(BaseModel):
+    ship_model: Optional[str] = Field(default=None, max_length=100)
+    system: Optional[str] = Field(default=None, max_length=160)
+    fuel: Optional[float] = Field(default=None, ge=0, le=100000)
+    share_ship_model: bool = False
+    share_system: bool = False
+    share_fuel: bool = False
+
+def init_shared_status(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_shared_status (
+            sam_id BIGINT PRIMARY KEY REFERENCES samanthas(id) ON DELETE CASCADE,
+            ship_model TEXT, system TEXT, fuel DOUBLE PRECISION,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+@app.post("/shared-status")
+def publish_shared_status(payload: SamSharedStatus,
+                          authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_shared_status(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sam_shared_status(sam_id,ship_model,system,fuel,updated_at)
+                VALUES (%s,%s,%s,%s,now()) ON CONFLICT(sam_id) DO UPDATE SET
+                ship_model=excluded.ship_model,system=excluded.system,
+                fuel=excluded.fuel,updated_at=now()""",
+                (me_id, payload.ship_model if payload.share_ship_model else None,
+                 payload.system if payload.share_system else None,
+                 payload.fuel if payload.share_fuel else None))
+    return {"ok": True}
+
+@app.get("/shared-status/{target}")
+def read_shared_status(target: str,
+                       authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_shared_status(conn)
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        target_id = find_sam(conn, target)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT EXISTS(
+                SELECT 1 FROM sam_liaisons WHERE etat='acceptee'
+                AND ((demandeur_id=%s AND destinataire_id=%s)
+                  OR (demandeur_id=%s AND destinataire_id=%s)))""",
+                (me_id,target_id,target_id,me_id))
+            if not cur.fetchone()[0]:
+                raise HTTPException(403, "Liaison acceptée requise")
+            cur.execute("""SELECT ship_model,system,fuel,updated_at
+                FROM sam_shared_status WHERE sam_id=%s
+                AND updated_at>now()-interval '10 minutes'""", (target_id,))
+            row=cur.fetchone()
+    return {"matricule":target,"ship_model":row[0] if row else None,
+            "system":row[1] if row else None,"fuel":row[2] if row else None}
