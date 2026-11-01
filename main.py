@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.7.0")
+app = FastAPI(title="Réseau SAM", version="0.8.0")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -85,7 +85,7 @@ def matricule(row_id: int, originelle: bool) -> str:
 
 @app.get("/")
 def accueil():
-    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.7.0"}
+    return {"service": "reseau-sam", "statut": "en_ligne", "version": "0.8.0"}
 
 
 @app.get("/health")
@@ -477,3 +477,73 @@ def recevoir_audio(liaison_id: int, apres: int = Query(default=0, ge=0),
         {"transmission_id": r[0], "auteur": labels[r[1]],
          "audio_b64": base64.b64encode(bytes(r[2])).decode("ascii")}
         for r in rows]}
+
+
+# --- V0.8 : partage volontaire et limite des informations de vol ---
+# Jamais de partage par défaut. La suppression de toutes les permissions
+# efface les informations précédemment publiées.
+class SharedStatus(BaseModel):
+    share_ship_model: bool = False
+    share_system: bool = False
+    share_fuel: bool = False
+    ship_model: str | None = Field(default=None, max_length=100)
+    system: str | None = Field(default=None, max_length=160)
+    fuel: float | None = Field(default=None, ge=0, le=100000)
+
+
+def init_shared_status(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_shared_status (
+            sam_id BIGINT PRIMARY KEY REFERENCES samanthas(id) ON DELETE CASCADE,
+            ship_model TEXT, system TEXT, fuel DOUBLE PRECISION,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+
+@app.post("/shared-status")
+def publish_shared_status(payload: SharedStatus,
+                          authorization: str | None = Header(default=None)):
+    with db() as conn:
+        me_id, _ = authenticated_sam(conn, authorization)
+        init_shared_status(conn)
+        model = payload.ship_model if payload.share_ship_model else None
+        system = payload.system if payload.share_system else None
+        fuel = payload.fuel if payload.share_fuel else None
+        with conn.cursor() as cur:
+            if not any((payload.share_ship_model, payload.share_system, payload.share_fuel)):
+                cur.execute("DELETE FROM sam_shared_status WHERE sam_id=%s", (me_id,))
+            else:
+                cur.execute("""INSERT INTO sam_shared_status
+                    (sam_id,ship_model,system,fuel,updated_at)
+                    VALUES (%s,%s,%s,%s,now())
+                    ON CONFLICT (sam_id) DO UPDATE SET
+                    ship_model=EXCLUDED.ship_model,
+                    system=EXCLUDED.system,
+                    fuel=EXCLUDED.fuel,updated_at=now()""",
+                    (me_id, model, system, fuel))
+    return {"ok": True}
+
+
+@app.get("/shared-status")
+def read_shared_status(authorization: str | None = Header(default=None)):
+    """Only show recently published information from accepted liaison partners."""
+    with db() as conn:
+        me_id, _ = authenticated_sam(conn, authorization)
+        init_shared_status(conn)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT s.id,s.is_originelle,st.ship_model,st.system,st.fuel
+                FROM sam_shared_status st
+                JOIN samanthas s ON s.id=st.sam_id
+                WHERE st.sam_id<>%s
+                  AND st.updated_at > now()-interval '60 seconds'
+                  AND EXISTS (
+                    SELECT 1 FROM sam_liaisons l
+                    WHERE l.etat='acceptee' AND
+                    ((l.demandeur_id=%s AND l.destinataire_id=st.sam_id)
+                    OR (l.destinataire_id=%s AND l.demandeur_id=st.sam_id))
+                  )
+                ORDER BY s.id LIMIT 100""", (me_id, me_id, me_id))
+            rows = cur.fetchall()
+    return {"contacts": [
+        {"matricule": matricule(r[0],r[1]),"ship_model":r[2],
+         "system":r[3],"fuel":r[4]} for r in rows]}
