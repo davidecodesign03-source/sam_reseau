@@ -26,6 +26,7 @@ jobs:
           for path, method in [
               ("/sos", "POST"),
               ("/sos", "GET"),
+              ("/sos/{sos_id}", "GET"),
               ("/sos/{sos_id}/volontaire", "POST"),
               ("/sos/{sos_id}/accepter", "POST"),
               ("/sos/{sos_id}/refuser", "POST"),
@@ -33,4 +34,23 @@ jobs:
           ]:
               assert any(p == path and method in methods for p, methods in routes), (path, method)
           print("Syntaxe et routes SOS OK")
+          PY
+
+      - name: Verifier les protections SOS par analyse statique
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          source = Path("main.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+          for name in ("sos_creer", "sos_lister", "sos_detail", "sos_volontaire", "sos_decider", "sos_annuler"):
+              assert name in functions, f"Fonction manquante: {name}"
+              body = ast.get_source_segment(source, functions[name])
+              assert "authenticated_sam" in body or name == "sos_decider", f"Authentification manquante: {name}"
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_volontaire"])
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_decider"])
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_annuler"])
+          assert "PRIMARY KEY(sos_id,sam_id)" in source
+          print("Structure, authentification, verrous et anti-doublons SOS : OK")
           PY
