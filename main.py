@@ -603,6 +603,32 @@ def sos_lister(authorization: str | None = Header(default=None)):
                     "etat":r[3],"candidat":labels.get(r[4]),
                     "created_at":r[5].isoformat()} for r in rows]}
 
+@app.get("/sos/{sos_id}")
+def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
+    """Etat du SOS et candidature personnelle, consultables après reconnexion."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SOS inconnu")
+            emitter, message, state, candidate, created = row
+            cur.execute("""SELECT etat FROM sam_sos_volontaires
+                WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
+            own = cur.fetchone()
+        labels = labels_for(conn, {x for x in (emitter, candidate) if x})
+    return {"sos_id": sos_id, "emetteur": labels[emitter],
+            "message": message, "etat": state,
+            "candidat": labels.get(candidate),
+            "ma_candidature": own[0] if own else None,
+            "je_suis_retenu": state == "attribue" and candidate == me,
+            "je_suis_emetteur": emitter == me,
+            "created_at": created.isoformat()}
+
+
 @app.post("/sos/{sos_id}/volontaire")
 def sos_volontaire(sos_id:int,authorization:str|None=Header(default=None)):
     with db() as conn:
