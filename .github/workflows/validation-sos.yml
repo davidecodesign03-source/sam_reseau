@@ -1,0 +1,36 @@
+name: Validation prototype SOS
+
+on:
+  push:
+    branches:
+      - feature/sos-candidatures-v09
+  workflow_dispatch:
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Installer les dependances
+        run: pip install -r requirements.txt
+      - name: Verifier la syntaxe Python
+        run: python -m py_compile main.py
+      - name: Verifier les routes SOS
+        run: |
+          python - <<'PY'
+          from main import app
+          routes = {(r.path, tuple(sorted(r.methods))) for r in app.routes}
+          for path, method in [
+              ("/sos", "POST"),
+              ("/sos", "GET"),
+              ("/sos/{sos_id}/volontaire", "POST"),
+              ("/sos/{sos_id}/accepter", "POST"),
+              ("/sos/{sos_id}/refuser", "POST"),
+              ("/sos/{sos_id}/annuler", "POST"),
+          ]:
+              assert any(p == path and method in methods for p, methods in routes), (path, method)
+          print("Syntaxe et routes SOS OK")
+          PY
