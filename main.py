@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.7.0")
+app = FastAPI(title="Réseau SAM", version="0.8.0")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -489,6 +489,13 @@ def envoyer_audio(liaison_id: int, payload: AudioTransmission,
         raise HTTPException(413, "Audio trop volumineux ou vide (1,5 Mo maximum)")
     if not audio.startswith(b"ID3") and audio[:2] not in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
         raise HTTPException(415, "MP3 attendu")
+    # Valider le client et sa liaison AVANT le traitement FFmpeg coûteux.
+    with db() as conn:
+        init_liaisons(conn)
+        me_id, _ = authenticated_sam(conn, authorization)
+        row = liaison_row(conn, liaison_id, me_id)
+        if row[3] != "acceptee":
+            raise HTTPException(409, "Liaison non acceptée")
     audio = sam_server_radio(audio)
     with db() as conn:
         init_liaisons(conn)
