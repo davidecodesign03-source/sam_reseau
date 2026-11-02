@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - feature/sos-candidatures-v09
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
