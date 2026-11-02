@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.8.0")
+app = FastAPI(title="Réseau SAM", version="0.9.0-rc1")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -557,6 +557,8 @@ def init_sos(conn):
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY(sos_id,sam_id)
         )""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sam_sos_un_actif_par_emetteur
+            ON sam_sos(emetteur_id) WHERE etat IN ('ouvert','propose','attribue')""")
         cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
             ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
 
@@ -579,6 +581,7 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
         init_sos(conn)
         me, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (me,))
             cur.execute("""SELECT id FROM sam_sos WHERE emetteur_id=%s
                 AND etat IN ('ouvert','propose','attribue') LIMIT 1""", (me,))
             if cur.fetchone():
