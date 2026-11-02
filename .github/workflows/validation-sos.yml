@@ -16,6 +16,10 @@ jobs:
           python-version: '3.12'
       - name: Installer les dependances
         run: pip install -r requirements.txt
+      - name: Installer le moteur de tests
+        run: pip install pytest
+      - name: Executer les tests de securite SOS
+        run: python -m pytest -q tests/test_sos_contract.py
       - name: Verifier la syntaxe Python
         run: python -m py_compile main.py
       - name: Verifier les routes SOS
