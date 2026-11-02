@@ -417,6 +417,52 @@ def quitter_reseau(authorization: str | None = Header(default=None)):
 # Le contenu MP3 est stocké dans PostgreSQL pour survivre aux redémarrages Render.
 import base64
 import binascii
+import subprocess
+import tempfile
+import random
+from pathlib import Path
+
+def sam_server_radio(mp3: bytes) -> bytes:
+    """Un seul traitement radio, au serveur. Retour original si conversion impossible."""
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+        with tempfile.TemporaryDirectory(prefix="sam_radio_") as td:
+            source = Path(td) / "entree.mp3"
+            output = Path(td) / "radio.mp3"
+            source.write_bytes(mp3)
+            # Parasites brefs à des instants variables, sans rendre la parole inaudible.
+            rng = random.Random(hashlib.sha256(mp3).digest())
+            delays = sorted(rng.randint(900, 4700) for _ in range(3))
+            # La voix garde la priorité; souffle continu et trois éclats discrets.
+            graph = (
+                "[0:a]highpass=f=420,lowpass=f=2450,"
+                "acompressor=threshold=-24dB:ratio=4:attack=3:release=85,"
+                "acrusher=bits=11:mode=lin,volume=0.93[v];"
+                "[1:a]volume=0.055[n];"
+                + ''.join(f"[{i+2}:a]volume=0.19,atrim=duration=0.10,adelay={d}|{d}[b{i}];" for i,d in enumerate(delays))
+                + "[v][n][b0][b1][b2]amix=inputs=5:duration=first:normalize=0,"
+                  "alimiter=limit=0.92[out]"
+            )
+            cmd = [ffmpeg, '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+                   '-i', str(source),
+                   '-f', 'lavfi', '-i', 'anoisesrc=color=pink:amplitude=0.12:sample_rate=44100',
+                   '-f', 'lavfi', '-i', 'anoisesrc=color=white:amplitude=0.4:sample_rate=44100',
+                   '-f', 'lavfi', '-i', 'anoisesrc=color=white:amplitude=0.4:sample_rate=44100',
+                   '-f', 'lavfi', '-i', 'anoisesrc=color=white:amplitude=0.4:sample_rate=44100',
+                   '-filter_complex', graph, '-map', '[out]', '-ac', '1',
+                   '-codec:a', 'libmp3lame', '-b:a', '80k', str(output)]
+            result = subprocess.run(cmd, capture_output=True, timeout=45)
+            if result.returncode:
+                raise RuntimeError(result.stderr.decode('utf-8', 'replace')[-500:])
+            processed = output.read_bytes()
+            if not (100 <= len(processed) <= 1_500_000):
+                raise ValueError('MP3 traité hors limite')
+            return processed
+    except Exception as exc:
+        logger.warning('SAM_RADIO_FALLBACK %s', str(exc)[:300])
+        return mp3
+
 
 class AudioTransmission(BaseModel):
     audio_b64: str = Field(min_length=1, max_length=2100000)
@@ -443,6 +489,7 @@ def envoyer_audio(liaison_id: int, payload: AudioTransmission,
         raise HTTPException(413, "Audio trop volumineux ou vide (1,5 Mo maximum)")
     if not audio.startswith(b"ID3") and audio[:2] not in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
         raise HTTPException(415, "MP3 attendu")
+    audio = sam_server_radio(audio)
     with db() as conn:
         init_liaisons(conn)
         init_audio(conn)
