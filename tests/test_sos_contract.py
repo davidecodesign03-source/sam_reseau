@@ -62,3 +62,22 @@ def test_only_emitter_can_decide_and_cancel():
 def test_authentication_on_public_sos_handlers():
     for name in ("sos_creer", "sos_lister", "sos_detail", "sos_volontaire", "sos_decider", "sos_annuler"):
         assert "authenticated_sam" in function_source(name)
+
+
+def test_sos_volunteer_restrictions():
+    source = function_source("sos_volontaire")
+    assert "row[0]==me" in source
+    assert "('ouvert','propose')" in source
+
+
+def test_sos_acceptance_and_refusal_paths():
+    source = function_source("sos_decider")
+    assert "etat='retenu'" in source
+    assert "etat='refuse'" in source
+    assert "sos_assign_next(cur,sos_id)" in source
+
+
+def test_sos_reconnection_state():
+    source = function_source("sos_detail")
+    assert "ma_candidature" in source
+    assert "je_suis_retenu" in source
