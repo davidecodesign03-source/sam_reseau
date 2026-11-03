@@ -119,3 +119,18 @@ def test_sos_cancellation_closes_only_dedicated_radio():
     assert "if dediee and liaison_id is not None:" in cancel
     assert "UPDATE sam_liaisons SET etat='terminee'" in cancel
     assert "UPDATE sam_sos SET etat='annule'" in cancel
+
+
+def test_sos_directory_does_not_publish_private_message():
+    source = function_source("sos_lister")
+    assert "SELECT id,emetteur_id,etat,created_at" in source
+    assert '"message":' not in source
+    assert '"candidat":' not in source
+
+
+def test_sos_detail_requires_participation_and_hides_rejected_candidates():
+    source = function_source("sos_detail")
+    assert "Détails réservés aux participants du SOS" in source
+    assert "Participation terminée" in source
+    assert "sos_refresh_candidate(cur, sos_id)" in source
+    assert "liaison_id if is_emitter or is_selected else None" in source
