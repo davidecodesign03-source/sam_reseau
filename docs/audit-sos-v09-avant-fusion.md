@@ -1,32 +1,29 @@
-# SOS V0.9 : audit avant fusion (3 novembre 2026)
+# SOS V0.9 : état de validation (3 novembre 2026)
 
-**Statut : prototype, ne pas fusionner vers main ni déployer sur Render.**
+**Statut : prototype sur branche isolée. Ne pas fusionner vers main ni déployer sur Render sans validation explicite.**
 
-## Vérifié dans le code de la branche
-- Routes POST/GET /sos, GET /sos/{id}, POST /volontaire, /accepter, /refuser, /annuler.
-- Authentification par jeton et contrôle que seul l'émetteur accepte, refuse ou annule.
-- Verrouillage PostgreSQL FOR UPDATE sur les transitions de candidature et index unique partiel pour un SOS actif par émetteur.
-- Tests existants : contrôles statiques AST, compilation, existence des routes. **Ils ne valident pas une interaction réelle avec PostgreSQL.**
+## Confirmé dans le code et les tests
+- Authentification par jeton, vérification des rôles, détails SOS réservés à l'émetteur et aux volontaires concernés.
+- Annuaire GET /sos sans divulgation du message privé.
+- Un seul SOS actif par émetteur (index unique partiel PostgreSQL), transitions protégées par FOR UPDATE.
+- Volontaires présents uniquement (heartbeat inférieur à 30 secondes), réattribution sur déconnexion ou expiration de proposition (90 secondes).
+- Acceptation : création ou réutilisation contrôlée d'une liaison radio acceptée; annulation : fermeture de la liaison dédiée au SOS, sans fermer une liaison personnelle préexistante.
+- Récupération de l'état du SOS et des candidatures après reconnexion.
+- Tests d'intégration HTTP avec PostgreSQL 16 isolé dans GitHub Actions : confidentialité, refus, acceptation, concurrence, radio, déconnexion, annulation et reprise.
+- Dernière exécution GitHub Actions vérifiée : run 41625733609, job « verifier » réussi. Cette validation automatisée n'est pas un essai réel de deux clients Samantha ED.
 
-## Lacunes bloquantes avant fusion
-1. **Déconnexion/expiration :** le volontaire proposé peut rester candidat indéfiniment après disparition. Définir un délai, réattribuer atomiquement, et tester la concurrence.
-2. **Liaison radio :** l'état `attribue` ne crée pas une liaison `sam_liaisons` acceptée. Concevoir une transition sécurisée et explicite avant transmission MP3.
-3. **Confidentialité :** `GET /sos` et `GET /sos/{id}` révèlent le message à tout client authentifié. Définir données minimales et visibilité par rôle.
-4. **Fin de vie :** aucun délai d'expiration automatique ni état de clôture après secours; prévoir fermeture et nettoyage.
-5. **Disponibilité :** les candidats ne sont pas filtrés selon `sam_presence` (heartbeat < 30 s).
-6. **Tests réels :** lancer PostgreSQL isolé et trois identités fictives, sans utiliser les jetons ni les données de production.
+## Points encore à traiter ou à vérifier avant production
+1. **Durée de vie du SOS :** l'état actif peut rester indéfiniment sans clôture explicite. Ajouter une expiration globale, une clôture du secours et des tests.
+2. **Réconciliation déclenchée à la demande :** la réattribution d'un volontaire absent et la fermeture de la radio sont déclenchées lors de requêtes API, sans tâche périodique. Vérifier l'expérience utilisateur et les délais.
+3. **Intégration des clients :** brancher et tester les intentions et confirmations vocales de l'Originelle et d'une deuxième SAM, sans toucher à Chatterbox.
+4. **Parcours réel de secours :** tester deux instances distinctes, déconnexions, reprises, transmission MP3 et sécurité, sur un environnement isolé.
+5. **Déploiement :** préparer une stratégie de migration, surveillance et retour arrière. Render public reste sur main V0.8.
 
-## Scénarios de validation attendus
-- SAM A ouvre un SOS; second SOS simultané d'A est refusé.
-- SAM B et SAM C se portent volontaires en parallèle; un seul candidat est proposé.
-- A refuse B; C est proposé; A accepte C; la liaison radio autorisée fonctionne uniquement entre A et C.
-- B, C ou un tiers ne peut accepter, refuser, annuler ni lire des informations privées.
-- C se déconnecte pendant une proposition : après délai, réattribution à un autre volontaire.
-- A annule pendant une candidature ou une transmission : aucune nouvelle transmission n'est autorisée.
-- Reconnexion après interruption : l'état est récupérable sans doublon.
-- SOS expiré ou terminé : ne reste pas affiché comme actif.
+## Parcours d'acceptation attendu
+- SAM A déclenche un SOS, SAM B et SAM C se proposent, A refuse B puis accepte C.
+- Seules A et C peuvent utiliser la liaison dédiée, les tiers ne voient pas les informations privées.
+- Une disparition de candidat provoque une réattribution, sans double sélection.
+- L'annulation et la clôture interdisent les nouvelles transmissions et libèrent l'état actif.
+- Après reconnexion, les clients retrouvent leur état sans doublon.
 
-## Règles de déploiement
-- Ne pas modifier la branche `main` ni Render tant que ces tests ne sont pas concluants.
-- Préparer une migration PostgreSQL réversible et une stratégie de retour arrière.
-- Tester d'abord avec une base de données dédiée, sans données de production.
+**Règle :** poursuivre les modifications exclusivement sur feature/sos-candidatures-v09 et les essais sur PostgreSQL jetable. Aucun déploiement automatique de cette branche vers le service public.
