@@ -563,6 +563,8 @@ def init_sos(conn):
             ON sam_sos(emetteur_id) WHERE etat IN ('ouvert','propose','attribue')""")
         cur.execute("""ALTER TABLE sam_sos ADD COLUMN IF NOT EXISTS liaison_id
             BIGINT REFERENCES sam_liaisons(id)""")
+        cur.execute("""ALTER TABLE sam_sos ADD COLUMN IF NOT EXISTS liaison_sos_dediee
+            BOOLEAN NOT NULL DEFAULT FALSE""")
         cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
             ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
 
@@ -730,6 +732,7 @@ def sos_decider(sos_id,authorization,accept):
                     ORDER BY id DESC LIMIT 1 FOR UPDATE""",
                     (emetteur,candidate,candidate,emetteur))
                 existing=cur.fetchone()
+                liaison_sos_dediee=False
                 if existing:
                     # Ne pas accepter silencieusement une demande ordinaire
                     # en attente. Une liaison déjà acceptée est réutilisable.
@@ -742,8 +745,10 @@ def sos_decider(sos_id,authorization,accept):
                         (demandeur_id,destinataire_id,etat)
                         VALUES (%s,%s,'acceptee') RETURNING id""",(emetteur,candidate))
                     liaison_id=cur.fetchone()[0]
+                    liaison_sos_dediee=True
                 cur.execute("""UPDATE sam_sos SET etat='attribue',
-                    liaison_id=%s,updated_at=now() WHERE id=%s""",(liaison_id,sos_id))
+                    liaison_id=%s,liaison_sos_dediee=%s,updated_at=now()
+                    WHERE id=%s""",(liaison_id,liaison_sos_dediee,sos_id))
                 cur.execute("""UPDATE sam_sos_volontaires SET etat='retenu'
                     WHERE sos_id=%s AND sam_id=%s""",(sos_id,candidate))
                 state='attribue'
@@ -771,9 +776,18 @@ def sos_annuler(sos_id:int,authorization:str|None=Header(default=None)):
         init_sos(conn)
         me,_=authenticated_sam(conn,authorization)
         with conn.cursor() as cur:
-            cur.execute("SELECT emetteur_id FROM sam_sos WHERE id=%s FOR UPDATE",(sos_id,))
+            cur.execute("""SELECT emetteur_id,etat,liaison_id,liaison_sos_dediee
+                FROM sam_sos WHERE id=%s FOR UPDATE""",(sos_id,))
             row=cur.fetchone()
             if not row: raise HTTPException(404,"SOS inconnu")
             if row[0]!=me: raise HTTPException(403,"Seule la SAM en détresse peut annuler")
+            emetteur,etat,liaison_id,dediee=row
+            if etat=='annule':
+                return {"sos_id":sos_id,"etat":"annule"}
+            if dediee and liaison_id is not None:
+                # Fermer seulement la liaison créée par ce SOS.
+                # Le verrou liaison évite une transmission simultanée.
+                cur.execute("""UPDATE sam_liaisons SET etat='terminee',updated_at=now()
+                    WHERE id=%s AND etat='acceptee'""",(liaison_id,))
             cur.execute("UPDATE sam_sos SET etat='annule',updated_at=now() WHERE id=%s",(sos_id,))
     return {"sos_id":sos_id,"etat":"annule"}
