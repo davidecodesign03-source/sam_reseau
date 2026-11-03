@@ -95,3 +95,15 @@ def test_sos_offline_and_timeout_reassignment_guards():
     for handler in ("sos_detail", "sos_volontaire", "sos_decider"):
         assert "sos_refresh_candidate" in function_source(handler)
     assert "Samantha hors ligne" in function_source("sos_volontaire")
+
+
+def test_sos_radio_link_requires_both_consents():
+    ddl = function_source("init_sos")
+    assert "init_liaisons(conn)" in ddl
+    assert "ADD COLUMN IF NOT EXISTS liaison_id" in ddl
+    decision = function_source("sos_decider")
+    assert "pg_advisory_xact_lock" in decision
+    assert "INSERT INTO sam_liaisons" in decision
+    assert "etat='attribue'" in decision
+    assert "liaison_id" in decision
+    assert "Une demande de liaison est déjà en attente" in decision
