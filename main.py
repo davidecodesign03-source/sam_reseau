@@ -668,11 +668,14 @@ def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
             if me != emitter and own is None:
                 raise HTTPException(403, "Détails réservés aux participants du SOS")
             sos_refresh_candidate(cur, sos_id)
+            cur.execute("""SELECT etat FROM sam_sos_volontaires
+                WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
+            own = cur.fetchone()
             cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at,liaison_id
                 FROM sam_sos WHERE id=%s""", (sos_id,))
             emitter, message, state, candidate, created, liaison_id = cur.fetchone()
             # Les candidats refusés ne voient plus le message privé.
-            if me != emitter and own[0] == 'refuse':
+            if me != emitter and (own is None or own[0] == 'refuse'):
                 raise HTTPException(403, "Participation terminée")
         labels = labels_for(conn, {x for x in (emitter, candidate) if x})
     is_emitter = emitter == me
