@@ -248,6 +248,7 @@ def test_closing_dedicated_radio_reconciles_sos(env_db):
     link_id = client.post(f"/sos/{sos_id}/accepter", headers=a).json()["liaison_id"]
     assert client.post(f"/liaisons/{link_id}/terminer", headers=b).status_code == 200
     assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
+    assert client.get(f"/sos/{sos_id}", headers=a).json()["etat"] == "annule"
     assert client.get("/sos/mes/candidatures", headers=b).json()["candidatures"] == []
     assert client.post(f"/liaisons/{link_id}/messages", headers=a,
                        json={"texte": "apres fermeture"}).status_code == 409
