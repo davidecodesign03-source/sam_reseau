@@ -669,6 +669,9 @@ def sos_mes_candidatures(authorization: str | None = Header(default=None)):
                     continue
                 sos_refresh_candidate(cur, sos_id)
                 sos_refresh_radio(cur, sos_id)
+                cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (sos_id,))
+                if cur.fetchone()[0] == 'annule':
+                    continue
                 cur.execute("""SELECT s.etat,s.candidat_id,s.liaison_id,v.etat
                     FROM sam_sos s JOIN sam_sos_volontaires v ON v.sos_id=s.id
                     WHERE s.id=%s AND v.sam_id=%s""",(sos_id,me))
@@ -699,6 +702,9 @@ def sos_mon_actif(authorization: str | None = Header(default=None)):
             sos_id = row[0]
             sos_refresh_candidate(cur, sos_id)
             sos_refresh_radio(cur, sos_id)
+            cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (sos_id,))
+            if cur.fetchone()[0] == 'annule':
+                return {"sos": None}
             cur.execute("""SELECT message,etat,candidat_id,liaison_id,created_at
                 FROM sam_sos WHERE id=%s""", (sos_id,))
             message, state, candidate, liaison_id, created = cur.fetchone()
