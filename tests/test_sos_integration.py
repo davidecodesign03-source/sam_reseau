@@ -281,7 +281,8 @@ def test_dedicated_radio_cannot_be_shared_between_active_sos(env_db):
     assert client.post(f"/sos/{first}/annuler", headers=a).status_code == 200
 
 
-def test_parallel_regular_radio_request_and_sos_acceptance_no_duplicate(env_db):
+@pytest.mark.parametrize('round_number', range(5))
+def test_parallel_regular_radio_request_and_sos_acceptance_no_duplicate(env_db, round_number):
     from concurrent.futures import ThreadPoolExecutor
     for name in ("a", "b"):
         register("token-" + name, "installation-" + name)
