@@ -539,6 +539,7 @@ class SOSCreation(BaseModel):
 def init_sos(conn):
     init_db(conn)
     init_presence(conn)
+    init_liaisons(conn)
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -560,6 +561,8 @@ def init_sos(conn):
         )""")
         cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sam_sos_un_actif_par_emetteur
             ON sam_sos(emetteur_id) WHERE etat IN ('ouvert','propose','attribue')""")
+        cur.execute("""ALTER TABLE sam_sos ADD COLUMN IF NOT EXISTS liaison_id
+            BIGINT REFERENCES sam_liaisons(id)""")
         cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
             ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
 
@@ -715,8 +718,32 @@ def sos_decider(sos_id,authorization,accept):
             if state!='propose' or candidate is None:
                 raise HTTPException(409,"Aucune proposition à décider")
             if accept:
-                cur.execute("""UPDATE sam_sos SET etat='attribue',updated_at=now()
-                    WHERE id=%s""",(sos_id,))
+                # La candidature volontaire et l'acceptation par l'émetteur
+                # constituent les deux consentements à cette liaison SOS.
+                # Le verrou sur le couple évite les doublons avec /liaisons.
+                a,b=sorted((emetteur,candidate))
+                cur.execute("SELECT pg_advisory_xact_lock(%s,%s)",(int(a),int(b)))
+                cur.execute("""SELECT id FROM sam_liaisons
+                    WHERE ((demandeur_id=%s AND destinataire_id=%s)
+                        OR (demandeur_id=%s AND destinataire_id=%s))
+                    AND etat IN ('en_attente','acceptee')
+                    ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                    (emetteur,candidate,candidate,emetteur))
+                existing=cur.fetchone()
+                if existing:
+                    # Ne pas accepter silencieusement une demande ordinaire
+                    # en attente. Une liaison déjà acceptée est réutilisable.
+                    cur.execute("SELECT etat FROM sam_liaisons WHERE id=%s",(existing[0],))
+                    if cur.fetchone()[0]!='acceptee':
+                        raise HTTPException(409,"Une demande de liaison est déjà en attente entre ces Samantha")
+                    liaison_id=existing[0]
+                else:
+                    cur.execute("""INSERT INTO sam_liaisons
+                        (demandeur_id,destinataire_id,etat)
+                        VALUES (%s,%s,'acceptee') RETURNING id""",(emetteur,candidate))
+                    liaison_id=cur.fetchone()[0]
+                cur.execute("""UPDATE sam_sos SET etat='attribue',
+                    liaison_id=%s,updated_at=now() WHERE id=%s""",(liaison_id,sos_id))
                 cur.execute("""UPDATE sam_sos_volontaires SET etat='retenu'
                     WHERE sos_id=%s AND sam_id=%s""",(sos_id,candidate))
                 state='attribue'
@@ -727,7 +754,8 @@ def sos_decider(sos_id,authorization,accept):
                 cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
                 state,candidate=cur.fetchone()
         labels=labels_for(conn,[candidate] if candidate else [])
-    return {"sos_id":sos_id,"etat":state,"candidat":labels.get(candidate)}
+    return {"sos_id":sos_id,"etat":state,"candidat":labels.get(candidate),
+            "liaison_id":liaison_id if accept else None}
 
 @app.post("/sos/{sos_id}/accepter")
 def sos_accepter(sos_id:int,authorization:str|None=Header(default=None)):
