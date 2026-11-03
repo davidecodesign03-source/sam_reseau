@@ -81,3 +81,17 @@ def test_sos_reconnection_state():
     source = function_source("sos_detail")
     assert "ma_candidature" in source
     assert "je_suis_retenu" in source
+
+
+def test_sos_offline_and_timeout_reassignment_guards():
+    init = function_source("init_sos")
+    assert "init_presence(conn)" in init
+    assign = function_source("sos_assign_next")
+    assert "sam_presence" in assign
+    assert "30 seconds" in assign
+    refresh = function_source("sos_refresh_candidate")
+    assert "90" in refresh
+    assert "sos_assign_next(cur, sos_id)" in refresh
+    for handler in ("sos_detail", "sos_volontaire", "sos_decider"):
+        assert "sos_refresh_candidate" in function_source(handler)
+    assert "Samantha hors ligne" in function_source("sos_volontaire")
