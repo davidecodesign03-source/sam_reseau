@@ -632,6 +632,38 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
             sos_id = cur.fetchone()[0]
     return {"sos_id":sos_id,"etat":"ouvert"}
 
+@app.get("/sos/mes/candidatures")
+def sos_mes_candidatures(authorization: str | None = Header(default=None)):
+    """Reprise des candidatures personnelles après reconnexion."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT s.id FROM sam_sos s
+                JOIN sam_sos_volontaires v ON v.sos_id=s.id
+                WHERE v.sam_id=%s AND s.etat IN ('ouvert','propose','attribue')
+                ORDER BY s.id DESC LIMIT 50""", (me,))
+            ids = [row[0] for row in cur.fetchall()]
+            results = []
+            for sos_id in ids:
+                cur.execute("SELECT id FROM sam_sos WHERE id=%s FOR UPDATE",(sos_id,))
+                if not cur.fetchone():
+                    continue
+                sos_refresh_candidate(cur, sos_id)
+                cur.execute("""SELECT s.etat,s.candidat_id,s.liaison_id,v.etat
+                    FROM sam_sos s JOIN sam_sos_volontaires v ON v.sos_id=s.id
+                    WHERE s.id=%s AND v.sam_id=%s""",(sos_id,me))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                state, candidate, liaison_id, own_state = row
+                selected = state == 'attribue' and candidate == me
+                results.append({"sos_id":sos_id,"etat":state,
+                    "ma_candidature":own_state,"je_suis_retenu":selected,
+                    "liaison_id":liaison_id if selected else None})
+    return {"candidatures":results}
+
+
 @app.get("/sos/mes/actif")
 def sos_mon_actif(authorization: str | None = Header(default=None)):
     """Reprise après redémarrage, sans création d'un nouveau SOS."""
