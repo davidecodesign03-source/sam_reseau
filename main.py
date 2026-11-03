@@ -642,9 +642,15 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
         with conn.cursor() as cur:
             cur.execute("SELECT pg_advisory_xact_lock(%s)", (me,))
             cur.execute("""SELECT id FROM sam_sos WHERE emetteur_id=%s
-                AND etat IN ('ouvert','propose','attribue') LIMIT 1""", (me,))
-            if cur.fetchone():
-                raise HTTPException(409, "Un SOS est déjà actif")
+                AND etat IN ('ouvert','propose','attribue') LIMIT 1 FOR UPDATE""", (me,))
+            existing = cur.fetchone()
+            if existing:
+                # Une radio dédiée fermée peut laisser un SOS attribué en base
+                # tant qu'aucune consultation n'a déclenché sa réconciliation.
+                sos_refresh_radio(cur, existing[0])
+                cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (existing[0],))
+                if cur.fetchone()[0] != 'annule':
+                    raise HTTPException(409, "Un SOS est déjà actif")
             cur.execute("""INSERT INTO sam_sos(emetteur_id,message)
                 VALUES (%s,%s) RETURNING id""", (me,payload.message))
             sos_id = cur.fetchone()[0]
