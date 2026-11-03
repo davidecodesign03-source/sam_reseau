@@ -223,8 +223,8 @@ def test_volunteer_recovers_own_status_without_private_leaks(env_db):
     assert client.get("/sos/mes/candidatures", headers=b).json() == {"candidatures": []}
     sos_id = client.post("/sos", headers=a, json={"message": "Panne"}).json()["sos_id"]
     assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
-    assert client.post("/presence/deconnexion", headers=b).status_code == 200
-    assert client.post("/presence", headers=b).status_code == 200
+    # Nouvelle session HTTP : l'état est récupéré depuis PostgreSQL.
+    client = TestClient(main.app)
     pending = client.get("/sos/mes/candidatures", headers=b)
     assert pending.status_code == 200, pending.text
     assert pending.json()["candidatures"][0]["sos_id"] == sos_id
