@@ -311,3 +311,52 @@ def test_parallel_regular_radio_request_and_sos_acceptance_no_duplicate(env_db, 
             cur.execute("""SELECT COUNT(*) FROM sam_liaisons
                 WHERE etat IN ('en_attente','acceptee')""")
             assert cur.fetchone()[0] == 1
+
+
+def test_sos_end_to_end_two_samanthas_radio_exchange_and_cleanup(env_db):
+    """Parcours réel API : alerte, volontaire, attribution, radio, fermeture."""
+    register("token-originelle-test", "installation-originelle-test")
+    register("token-secours-test", "installation-secours-test")
+    client = TestClient(main.app)
+    originelle = auth("token-originelle-test")
+    secours = auth("token-secours-test")
+    for headers in (originelle, secours):
+        assert client.post("/presence", headers=headers).status_code == 200
+
+    created = client.post("/sos", headers=originelle,
+                          json={"message": "Assistance carburant demandee"})
+    assert created.status_code == 201, created.text
+    sos_id = created.json()["sos_id"]
+    available = client.get("/sos", headers=secours)
+    assert available.status_code == 200, available.text
+    assert str(sos_id) in available.text
+    assert "Assistance carburant demandee" not in available.text
+
+    volunteer = client.post(f"/sos/{sos_id}/volontaire", headers=secours)
+    assert volunteer.status_code == 200, volunteer.text
+    accepted = client.post(f"/sos/{sos_id}/accepter", headers=originelle)
+    assert accepted.status_code == 200, accepted.text
+    liaison_id = accepted.json()["liaison_id"]
+    assert liaison_id
+    resumed = client.get("/sos/mes/candidatures", headers=secours)
+    assert resumed.status_code == 200, resumed.text
+    assert any(c["sos_id"] == sos_id and c["je_suis_retenu"]
+               and c["liaison_id"] == liaison_id
+               for c in resumed.json()["candidatures"])
+
+    for headers, message in ((originelle, "Je suis en panne"),
+                             (secours, "Je viens vous aider")):
+        sent = client.post(f"/liaisons/{liaison_id}/messages",
+                           headers=headers, json={"texte": message})
+        assert sent.status_code == 201, sent.text
+    for headers in (originelle, secours):
+        received = client.get(f"/liaisons/{liaison_id}/messages", headers=headers)
+        assert received.status_code == 200, received.text
+        assert "Je suis en panne" in received.text
+        assert "Je viens vous aider" in received.text
+
+    cancelled = client.post(f"/sos/{sos_id}/annuler", headers=originelle)
+    assert cancelled.status_code == 200, cancelled.text
+    assert client.post(f"/liaisons/{liaison_id}/messages", headers=secours,
+                       json={"texte": "Apres fermeture"}).status_code == 409
+    assert client.get("/sos/mes/actif", headers=originelle).json() == {"sos": None}
