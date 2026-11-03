@@ -187,3 +187,27 @@ def test_parallel_acceptance_creates_one_radio_link(env_db):
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM sam_liaisons WHERE etat='acceptee'")
             assert cur.fetchone()[0] == 1
+
+
+def test_recover_own_active_sos_after_reconnect(env_db):
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
+    assert client.post("/presence", headers=a).status_code == 200
+    assert client.post("/presence", headers=b).status_code == 200
+    created = client.post("/sos", headers=a, json={"message": "SOS persistant"})
+    assert created.status_code == 201
+    sos_id = created.json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    assert client.post("/presence/deconnexion", headers=a).status_code == 200
+    assert client.post("/presence", headers=a).status_code == 200
+    resumed = client.get("/sos/mes/actif", headers=a)
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["sos"]["sos_id"] == sos_id
+    assert resumed.json()["sos"]["message"] == "SOS persistant"
+    assert client.get("/sos/mes/actif", headers=b).json() == {"sos": None}
+    assert client.post("/sos", headers=a, json={"message": "double"}).status_code == 409
+    assert client.post(f"/sos/{sos_id}/annuler", headers=a).status_code == 200
+    assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
