@@ -211,3 +211,26 @@ def test_recover_own_active_sos_after_reconnect(env_db):
     assert client.post("/sos", headers=a, json={"message": "double"}).status_code == 409
     assert client.post(f"/sos/{sos_id}/annuler", headers=a).status_code == 200
     assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
+
+
+def test_volunteer_recovers_own_status_without_private_leaks(env_db):
+    for name in ("a", "b", "outsider"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b, outsider = (auth("token-" + name) for name in ("a", "b", "outsider"))
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    assert client.get("/sos/mes/candidatures", headers=b).json() == {"candidatures": []}
+    sos_id = client.post("/sos", headers=a, json={"message": "Panne"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    assert client.post("/presence/deconnexion", headers=b).status_code == 200
+    assert client.post("/presence", headers=b).status_code == 200
+    pending = client.get("/sos/mes/candidatures", headers=b)
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["candidatures"][0]["sos_id"] == sos_id
+    assert "message" not in pending.text
+    assert client.get("/sos/mes/candidatures", headers=outsider).json() == {"candidatures": []}
+    assert client.post(f"/sos/{sos_id}/accepter", headers=a).status_code == 200
+    selected = client.get("/sos/mes/candidatures", headers=b).json()["candidatures"][0]
+    assert selected["je_suis_retenu"] is True
+    assert selected["liaison_id"]
