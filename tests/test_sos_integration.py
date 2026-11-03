@@ -279,3 +279,34 @@ def test_dedicated_radio_cannot_be_shared_between_active_sos(env_db):
     assert client.get(f"/sos/{first}", headers=a).json()["etat"] == "attribue"
     assert client.post(f"/sos/{second}/annuler", headers=b).status_code == 200
     assert client.post(f"/sos/{first}/annuler", headers=a).status_code == 200
+
+
+def test_parallel_regular_radio_request_and_sos_acceptance_no_duplicate(env_db):
+    from concurrent.futures import ThreadPoolExecutor
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Radio urgente"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+
+    def ordinary():
+        return client.post("/liaisons", headers=a, json={"destinataire": "002"})
+
+    def emergency():
+        return client.post(f"/sos/{sos_id}/accepter", headers=a)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        normal_future = pool.submit(ordinary)
+        sos_future = pool.submit(emergency)
+        normal, urgent = normal_future.result(), sos_future.result()
+    assert sorted([normal.status_code, urgent.status_code]) == [201, 409] or (
+        normal.status_code == 409 and urgent.status_code == 200
+    ), (normal.text, urgent.text)
+    with main.db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT COUNT(*) FROM sam_liaisons
+                WHERE etat IN ('en_attente','acceptee')""")
+            assert cur.fetchone()[0] == 1
