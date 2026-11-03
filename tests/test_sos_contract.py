@@ -107,3 +107,15 @@ def test_sos_radio_link_requires_both_consents():
     assert "etat='attribue'" in decision
     assert "liaison_id" in decision
     assert "Une demande de liaison est déjà en attente" in decision
+
+
+def test_sos_cancellation_closes_only_dedicated_radio():
+    ddl = function_source("init_sos")
+    assert "liaison_sos_dediee" in ddl
+    decision = function_source("sos_decider")
+    assert "liaison_sos_dediee=False" in decision
+    assert "liaison_sos_dediee=True" in decision
+    cancel = function_source("sos_annuler")
+    assert "if dediee and liaison_id is not None:" in cancel
+    assert "UPDATE sam_liaisons SET etat='terminee'" in cancel
+    assert "UPDATE sam_sos SET etat='annule'" in cancel
