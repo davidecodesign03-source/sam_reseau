@@ -632,6 +632,30 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
             sos_id = cur.fetchone()[0]
     return {"sos_id":sos_id,"etat":"ouvert"}
 
+@app.get("/sos/mes/actif")
+def sos_mon_actif(authorization: str | None = Header(default=None)):
+    """Reprise après redémarrage, sans création d'un nouveau SOS."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id FROM sam_sos
+                WHERE emetteur_id=%s AND etat IN ('ouvert','propose','attribue')
+                ORDER BY id DESC LIMIT 1 FOR UPDATE""", (me,))
+            row = cur.fetchone()
+            if not row:
+                return {"sos": None}
+            sos_id = row[0]
+            sos_refresh_candidate(cur, sos_id)
+            cur.execute("""SELECT message,etat,candidat_id,liaison_id,created_at
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            message, state, candidate, liaison_id, created = cur.fetchone()
+        labels = labels_for(conn, [candidate] if candidate else [])
+    return {"sos": {"sos_id": sos_id, "message": message, "etat": state,
+                    "candidat": labels.get(candidate), "liaison_id": liaison_id,
+                    "created_at": created.isoformat()}}
+
+
 @app.get("/sos")
 def sos_lister(authorization: str | None = Header(default=None)):
     """Annuaire minimal : aucun message ni candidat nominatif divulgué."""
