@@ -97,6 +97,16 @@ def health():
     return {"ok": True}
 
 
+@app.get("/health/db")
+def health_database():
+    """Vérification en lecture seule, sans identité SAM ni détail sensible."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            ok = cur.fetchone()[0] == 1
+    return {"ok": ok, "database": "connected" if ok else "unavailable"}
+
+
 def create_registration(payload: Inscription, originelle: bool):
     token = secrets.token_urlsafe(32)
     with db() as conn:
