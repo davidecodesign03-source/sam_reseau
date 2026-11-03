@@ -538,6 +538,7 @@ class SOSCreation(BaseModel):
 
 def init_sos(conn):
     init_db(conn)
+    init_presence(conn)
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -562,10 +563,20 @@ def init_sos(conn):
         cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
             ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
 
+# V0.9 : un candidat doit être présent sur le réseau (heartbeat < 30 s).
+# Les transitions s'effectuent sous verrou FOR UPDATE sur sam_sos.
 def sos_assign_next(cur, sos_id):
-    cur.execute("""SELECT sam_id FROM sam_sos_volontaires
-                   WHERE sos_id=%s AND etat='en_attente'
-                   ORDER BY created_at,sam_id LIMIT 1""", (sos_id,))
+    cur.execute("""UPDATE sam_sos_volontaires v SET etat='refuse'
+                   WHERE v.sos_id=%s AND v.etat='en_attente'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sam_presence p WHERE p.sam_id=v.sam_id
+                       AND p.last_seen > now()-interval '30 seconds'
+                   )""", (sos_id,))
+    cur.execute("""SELECT v.sam_id FROM sam_sos_volontaires v
+                   JOIN sam_presence p ON p.sam_id=v.sam_id
+                   WHERE v.sos_id=%s AND v.etat='en_attente'
+                   AND p.last_seen > now()-interval '30 seconds'
+                   ORDER BY v.created_at,v.sam_id LIMIT 1""", (sos_id,))
     row = cur.fetchone()
     if row:
         cur.execute("""UPDATE sam_sos SET etat='propose', candidat_id=%s,
@@ -574,6 +585,31 @@ def sos_assign_next(cur, sos_id):
     cur.execute("""UPDATE sam_sos SET etat='ouvert', candidat_id=NULL,
                    updated_at=now() WHERE id=%s""", (sos_id,))
     return None
+
+
+def sos_refresh_candidate(cur, sos_id):
+    """Réattribue une proposition expirée ou dont le volontaire est hors ligne.
+
+    Appeler après verrouillage de la ligne sam_sos (FOR UPDATE).
+    Expiration évaluée lors des requêtes, sans tâche de fond.
+    """
+    cur.execute("""SELECT etat,candidat_id,updated_at FROM sam_sos
+                   WHERE id=%s""", (sos_id,))
+    row = cur.fetchone()
+    if not row or row[0] != 'propose' or row[1] is None:
+        return
+    state, candidate, updated = row
+    cur.execute("""SELECT EXISTS(
+                   SELECT 1 FROM sam_presence
+                   WHERE sam_id=%s AND last_seen > now()-interval '30 seconds'
+                   )""", (candidate,))
+    online = cur.fetchone()[0]
+    expired = (datetime.now(timezone.utc) - updated).total_seconds() > 90
+    if not online or expired:
+        cur.execute("""UPDATE sam_sos_volontaires SET etat='refuse'
+                       WHERE sos_id=%s AND sam_id=%s AND etat='en_attente'""",
+                    (sos_id, candidate))
+        sos_assign_next(cur, sos_id)
 
 @app.post("/sos", status_code=201)
 def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=None)):
@@ -614,11 +650,14 @@ def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
         me, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
             cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at
-                FROM sam_sos WHERE id=%s""", (sos_id,))
+                FROM sam_sos WHERE id=%s FOR UPDATE""", (sos_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "SOS inconnu")
-            emitter, message, state, candidate, created = row
+            sos_refresh_candidate(cur, sos_id)
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            emitter, message, state, candidate, created = cur.fetchone()
             cur.execute("""SELECT etat FROM sam_sos_volontaires
                 WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
             own = cur.fetchone()
@@ -642,11 +681,18 @@ def sos_volontaire(sos_id:int,authorization:str|None=Header(default=None)):
             row=cur.fetchone()
             if not row: raise HTTPException(404,"SOS inconnu")
             if row[0]==me: raise HTTPException(400,"Impossible de se secourir soi-même")
-            if row[1] not in ('ouvert','propose'):
+            sos_refresh_candidate(cur,sos_id)
+            cur.execute("SELECT etat FROM sam_sos WHERE id=%s",(sos_id,))
+            current_state=cur.fetchone()[0]
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM sam_presence
+                WHERE sam_id=%s AND last_seen > now()-interval '30 seconds')""",(me,))
+            if not cur.fetchone()[0]:
+                raise HTTPException(409,"Samantha hors ligne : signaler sa présence avant candidature")
+            if current_state not in ('ouvert','propose'):
                 raise HTTPException(409,"SOS non disponible")
             cur.execute("""INSERT INTO sam_sos_volontaires(sos_id,sam_id)
                 VALUES (%s,%s) ON CONFLICT DO NOTHING""",(sos_id,me))
-            if row[1]=='ouvert':
+            if current_state=='ouvert':
                 sos_assign_next(cur,sos_id)
             cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
             state,candidate=cur.fetchone()
@@ -662,6 +708,9 @@ def sos_decider(sos_id,authorization,accept):
             row=cur.fetchone()
             if not row: raise HTTPException(404,"SOS inconnu")
             emetteur,state,candidate=row
+            sos_refresh_candidate(cur,sos_id)
+            cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
+            state,candidate=cur.fetchone()
             if me!=emetteur: raise HTTPException(403,"Seule la SAM en détresse décide")
             if state!='propose' or candidate is None:
                 raise HTTPException(409,"Aucune proposition à décider")
