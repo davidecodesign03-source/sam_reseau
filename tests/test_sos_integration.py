@@ -247,6 +247,11 @@ def test_closing_dedicated_radio_reconciles_sos(env_db):
     assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
     link_id = client.post(f"/sos/{sos_id}/accepter", headers=a).json()["liaison_id"]
     assert client.post(f"/liaisons/{link_id}/terminer", headers=b).status_code == 200
+    # Aucun GET de réconciliation préalable : POST /sos doit se réparer lui-même.
+    renewed = client.post("/sos", headers=a, json={"message": "Secours suivant"})
+    assert renewed.status_code == 201, renewed.text
+    assert renewed.json()["sos_id"] != sos_id
+    assert client.post(f"/sos/{renewed.json()['sos_id']}/annuler", headers=a).status_code == 200
     assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
     assert client.get(f"/sos/{sos_id}", headers=a).json()["etat"] == "annule"
     assert client.get("/sos/mes/candidatures", headers=b).json()["candidatures"] == []
