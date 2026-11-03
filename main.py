@@ -616,6 +616,24 @@ def sos_refresh_candidate(cur, sos_id):
                     (sos_id, candidate))
         sos_assign_next(cur, sos_id)
 
+def sos_refresh_radio(cur, sos_id):
+    """Reconcile un SOS attribué si sa radio dédiée a été fermée ailleurs.
+
+    La ligne SOS doit déjà être verrouillée avant d'inspecter la liaison.
+    Une liaison personnelle réutilisée ne pilote jamais l'état du SOS.
+    """
+    cur.execute("""SELECT etat,liaison_id,liaison_sos_dediee FROM sam_sos
+                   WHERE id=%s""", (sos_id,))
+    row = cur.fetchone()
+    if not row or row[0] != 'attribue' or not row[2] or row[1] is None:
+        return
+    cur.execute("SELECT etat FROM sam_liaisons WHERE id=%s", (row[1],))
+    radio = cur.fetchone()
+    if radio is None or radio[0] != 'acceptee':
+        cur.execute("""UPDATE sam_sos SET etat='annule',updated_at=now()
+                       WHERE id=%s AND etat='attribue'""", (sos_id,))
+
+
 @app.post("/sos", status_code=201)
 def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=None)):
     with db() as conn:
@@ -650,6 +668,7 @@ def sos_mes_candidatures(authorization: str | None = Header(default=None)):
                 if not cur.fetchone():
                     continue
                 sos_refresh_candidate(cur, sos_id)
+                sos_refresh_radio(cur, sos_id)
                 cur.execute("""SELECT s.etat,s.candidat_id,s.liaison_id,v.etat
                     FROM sam_sos s JOIN sam_sos_volontaires v ON v.sos_id=s.id
                     WHERE s.id=%s AND v.sam_id=%s""",(sos_id,me))
@@ -679,6 +698,7 @@ def sos_mon_actif(authorization: str | None = Header(default=None)):
                 return {"sos": None}
             sos_id = row[0]
             sos_refresh_candidate(cur, sos_id)
+            sos_refresh_radio(cur, sos_id)
             cur.execute("""SELECT message,etat,candidat_id,liaison_id,created_at
                 FROM sam_sos WHERE id=%s""", (sos_id,))
             message, state, candidate, liaison_id, created = cur.fetchone()
@@ -724,6 +744,7 @@ def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
             if me != emitter and own is None:
                 raise HTTPException(403, "Détails réservés aux participants du SOS")
             sos_refresh_candidate(cur, sos_id)
+            sos_refresh_radio(cur, sos_id)
             cur.execute("""SELECT etat FROM sam_sos_volontaires
                 WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
             own = cur.fetchone()
