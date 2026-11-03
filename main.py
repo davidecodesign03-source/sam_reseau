@@ -634,45 +634,56 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
 
 @app.get("/sos")
 def sos_lister(authorization: str | None = Header(default=None)):
+    """Annuaire minimal : aucun message ni candidat nominatif divulgué."""
     with db() as conn:
         init_sos(conn)
         me, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
-            cur.execute("""SELECT id,emetteur_id,message,etat,candidat_id,created_at
+            cur.execute("""SELECT id,emetteur_id,etat,created_at
                 FROM sam_sos WHERE etat IN ('ouvert','propose','attribue')
                 ORDER BY id DESC LIMIT 50""")
             rows = cur.fetchall()
-        labels = labels_for(conn,{x for r in rows for x in (r[1],r[4]) if x})
-    return {"sos":[{"sos_id":r[0],"emetteur":labels[r[1]],"message":r[2],
-                    "etat":r[3],"candidat":labels.get(r[4]),
-                    "created_at":r[5].isoformat()} for r in rows]}
+        labels = labels_for(conn,{r[1] for r in rows})
+    return {"sos":[{"sos_id":r[0],"emetteur":labels[r[1]],
+                    "etat":r[2],"created_at":r[3].isoformat()}
+                   for r in rows]}
+
 
 @app.get("/sos/{sos_id}")
 def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
-    """Etat du SOS et candidature personnelle, consultables après reconnexion."""
+    """Détails réservés à l'émetteur et aux volontaires du SOS."""
     with db() as conn:
         init_sos(conn)
         me, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
-            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at,liaison_id
                 FROM sam_sos WHERE id=%s FOR UPDATE""", (sos_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(404, "SOS inconnu")
-            sos_refresh_candidate(cur, sos_id)
-            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at
-                FROM sam_sos WHERE id=%s""", (sos_id,))
-            emitter, message, state, candidate, created = cur.fetchone()
+            emitter = row[0]
             cur.execute("""SELECT etat FROM sam_sos_volontaires
                 WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
             own = cur.fetchone()
+            if me != emitter and own is None:
+                raise HTTPException(403, "Détails réservés aux participants du SOS")
+            sos_refresh_candidate(cur, sos_id)
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at,liaison_id
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            emitter, message, state, candidate, created, liaison_id = cur.fetchone()
+            # Les candidats refusés ne voient plus le message privé.
+            if me != emitter and own[0] == 'refuse':
+                raise HTTPException(403, "Participation terminée")
         labels = labels_for(conn, {x for x in (emitter, candidate) if x})
+    is_emitter = emitter == me
+    is_selected = state == "attribue" and candidate == me
     return {"sos_id": sos_id, "emetteur": labels[emitter],
             "message": message, "etat": state,
-            "candidat": labels.get(candidate),
+            "candidat": labels.get(candidate) if is_emitter or is_selected else None,
             "ma_candidature": own[0] if own else None,
-            "je_suis_retenu": state == "attribue" and candidate == me,
-            "je_suis_emetteur": emitter == me,
+            "je_suis_retenu": is_selected,
+            "je_suis_emetteur": is_emitter,
+            "liaison_id": liaison_id if is_emitter or is_selected else None,
             "created_at": created.isoformat()}
 
 
