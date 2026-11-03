@@ -234,3 +234,22 @@ def test_volunteer_recovers_own_status_without_private_leaks(env_db):
     selected = client.get("/sos/mes/candidatures", headers=b).json()["candidatures"][0]
     assert selected["je_suis_retenu"] is True
     assert selected["liaison_id"]
+
+
+def test_closing_dedicated_radio_reconciles_sos(env_db):
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Besoin de secours"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    link_id = client.post(f"/sos/{sos_id}/accepter", headers=a).json()["liaison_id"]
+    assert client.post(f"/liaisons/{link_id}/terminer", headers=b).status_code == 200
+    assert client.get("/sos/mes/actif", headers=a).json() == {"sos": None}
+    assert client.get("/sos/mes/candidatures", headers=b).json()["candidatures"] == []
+    assert client.post(f"/liaisons/{link_id}/messages", headers=a,
+                       json={"texte": "apres fermeture"}).status_code == 409
+    # L'émetteur peut de nouveau lancer un secours.
+    assert client.post("/sos", headers=a, json={"message": "Nouveau SOS"}).status_code == 201
