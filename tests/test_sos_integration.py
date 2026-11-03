@@ -80,3 +80,50 @@ def test_sos_privacy_reassignment_radio_and_cancel(env_db):
     assert client.post(f"/sos/{sos_id}/annuler", headers=a).status_code == 200
     assert client.post(f"/liaisons/{link_id}/messages", headers=c,
                        json={"texte": "apres annulation"}).status_code == 409
+
+
+def test_refusal_moves_to_next_volunteer(env_db):
+    for name in ("a", "b", "c"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b, c = (auth("token-" + name) for name in ("a", "b", "c"))
+    for who in (a, b, c):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Assistance"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=c).status_code == 200
+    refused = client.post(f"/sos/{sos_id}/refuser", headers=a)
+    assert refused.status_code == 200, refused.text
+    assert refused.json()["etat"] == "propose"
+    assert client.get(f"/sos/{sos_id}", headers=b).status_code == 403
+    assert client.get(f"/sos/{sos_id}", headers=c).status_code == 200
+    accepted = client.post(f"/sos/{sos_id}/accepter", headers=a)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["liaison_id"]
+
+
+def test_cancel_preserves_preexisting_accepted_radio(env_db):
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    with main.db() as conn:
+        main.init_liaisons(conn)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM samanthas WHERE installation_id=%s", ("installation-a",))
+            aid = cur.fetchone()[0]
+            cur.execute("SELECT id FROM samanthas WHERE installation_id=%s", ("installation-b",))
+            bid = cur.fetchone()[0]
+            cur.execute("""INSERT INTO sam_liaisons(demandeur_id,destinataire_id,etat)
+                           VALUES (%s,%s,'acceptee') RETURNING id""", (aid,bid))
+            existing_id = cur.fetchone()[0]
+    sos_id = client.post("/sos", headers=a, json={"message": "Besoin d'aide"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    accepted = client.post(f"/sos/{sos_id}/accepter", headers=a)
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["liaison_id"] == existing_id
+    assert client.post(f"/sos/{sos_id}/annuler", headers=a).status_code == 200
+    assert client.post(f"/liaisons/{existing_id}/messages", headers=b,
+                       json={"texte": "liaison personnelle toujours active"}).status_code == 201
