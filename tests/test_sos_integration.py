@@ -127,3 +127,63 @@ def test_cancel_preserves_preexisting_accepted_radio(env_db):
     assert client.post(f"/sos/{sos_id}/annuler", headers=a).status_code == 200
     assert client.post(f"/liaisons/{existing_id}/messages", headers=b,
                        json={"texte": "liaison personnelle toujours active"}).status_code == 201
+
+
+def test_expired_offer_moves_to_next_candidate(env_db):
+    for name in ("a", "b", "c"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b, c = (auth("token-" + name) for name in ("a", "b", "c"))
+    for who in (a, b, c):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Assistance urgente"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=c).status_code == 200
+    with main.db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""UPDATE sam_sos SET updated_at=now()-interval '2 minutes'
+                           WHERE id=%s""", (sos_id,))
+    detail = client.get(f"/sos/{sos_id}", headers=a)
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["etat"] == "propose"
+    assert client.get(f"/sos/{sos_id}", headers=b).status_code == 403
+    assert client.post(f"/sos/{sos_id}/accepter", headers=a).status_code == 200
+
+
+def test_unauthorized_decisions_and_cancel_are_rejected(env_db):
+    for name in ("a", "b", "outsider"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b, outsider = (auth("token-" + name) for name in ("a", "b", "outsider"))
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Panne moteur"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+    for path in ("accepter", "refuser", "annuler"):
+        assert client.post(f"/sos/{sos_id}/{path}", headers=outsider).status_code == 403
+        assert client.post(f"/sos/{sos_id}/{path}", headers=b).status_code == 403
+    assert client.post(f"/sos/{sos_id}/accepter", headers=a).status_code == 200
+    assert client.post(f"/sos/{sos_id}/accepter", headers=a).status_code == 409
+
+
+def test_parallel_acceptance_creates_one_radio_link(env_db):
+    from concurrent.futures import ThreadPoolExecutor
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    sos_id = client.post("/sos", headers=a, json={"message": "Secours"}).json()["sos_id"]
+    assert client.post(f"/sos/{sos_id}/volontaire", headers=b).status_code == 200
+
+    def accept(_):
+        return client.post(f"/sos/{sos_id}/accepter", headers=a)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(accept, range(2)))
+    assert sorted(r.status_code for r in responses) == [200, 409]
+    with main.db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM sam_liaisons WHERE etat='acceptee'")
+            assert cur.fetchone()[0] == 1
