@@ -843,6 +843,17 @@ def sos_decider(sos_id,authorization,accept):
                     if cur.fetchone()[0]!='acceptee':
                         raise HTTPException(409,"Une demande de liaison est déjà en attente entre ces Samantha")
                     liaison_id=existing[0]
+                    # Une radio créée pour un SOS encore actif ne doit pas
+                    # être empruntée par un autre secours : sa fermeture
+                    # pourrait interrompre les deux interventions.
+                    cur.execute("""SELECT EXISTS(
+                        SELECT 1 FROM sam_sos
+                        WHERE liaison_id=%s AND etat='attribue'
+                        AND liaison_sos_dediee=TRUE
+                    )""", (liaison_id,))
+                    if cur.fetchone()[0]:
+                        raise HTTPException(409,
+                            "Cette radio est réservée à un autre SOS actif")
                 else:
                     cur.execute("""INSERT INTO sam_liaisons
                         (demandeur_id,destinataire_id,etat)
