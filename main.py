@@ -57,6 +57,10 @@ def db():
 
 
 def init_db(conn):
+    # Toutes les initialisations de schéma utilisent le même verrou transactionnel.
+    # Empêche les interblocages DDL lors des appels radio/SOS concurrents.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(31090001)")
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS samanthas (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -181,6 +185,10 @@ def authenticated_sam(conn, authorization):
 
 
 def init_liaisons(conn):
+    # Même verrou que init_db : ordre constant avant les DDL, y compris
+    # quand init_sos appelle les deux initialisations dans une transaction.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(31090001)")
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS sam_liaisons (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
