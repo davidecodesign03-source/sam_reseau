@@ -259,3 +259,23 @@ def test_closing_dedicated_radio_reconciles_sos(env_db):
                        json={"texte": "apres fermeture"}).status_code == 409
     # L'émetteur peut de nouveau lancer un secours.
     assert client.post("/sos", headers=a, json={"message": "Nouveau SOS"}).status_code == 201
+
+
+def test_dedicated_radio_cannot_be_shared_between_active_sos(env_db):
+    for name in ("a", "b"):
+        register("token-" + name, "installation-" + name)
+    client = TestClient(main.app)
+    a, b = auth("token-a"), auth("token-b")
+    for who in (a, b):
+        assert client.post("/presence", headers=who).status_code == 200
+    first = client.post("/sos", headers=a, json={"message": "Premier secours"}).json()["sos_id"]
+    assert client.post(f"/sos/{first}/volontaire", headers=b).status_code == 200
+    first_radio = client.post(f"/sos/{first}/accepter", headers=a)
+    assert first_radio.status_code == 200, first_radio.text
+    second = client.post("/sos", headers=b, json={"message": "Second secours"}).json()["sos_id"]
+    assert client.post(f"/sos/{second}/volontaire", headers=a).status_code == 200
+    blocked = client.post(f"/sos/{second}/accepter", headers=b)
+    assert blocked.status_code == 409, blocked.text
+    assert client.get(f"/sos/{first}", headers=a).json()["etat"] == "attribue"
+    assert client.post(f"/sos/{second}/annuler", headers=b).status_code == 200
+    assert client.post(f"/sos/{first}/annuler", headers=a).status_code == 200
