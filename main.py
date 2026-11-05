@@ -923,3 +923,75 @@ def sos_annuler(sos_id:int,authorization:str|None=Header(default=None)):
                     WHERE id=%s AND etat='acceptee'""",(liaison_id,))
             cur.execute("UPDATE sam_sos SET etat='annule',updated_at=now() WHERE id=%s",(sos_id,))
     return {"sos_id":sos_id,"etat":"annule"}
+
+
+# --- Rencontre stellaire : présence de système (expérimentation isolée) ---
+# Opt-in explicite par client. Les données périment avec le heartbeat existant.
+class SamSystemPresence(BaseModel):
+    system_name: str = Field(min_length=1, max_length=128)
+    system_address: int | None = Field(default=None, ge=0)
+    visible: bool = True
+
+
+def init_system_presence(conn):
+    init_presence(conn)
+    with conn.cursor() as cur:
+        cur.execute("""ALTER TABLE sam_presence
+                       ADD COLUMN IF NOT EXISTS system_name TEXT""")
+        cur.execute("""ALTER TABLE sam_presence
+                       ADD COLUMN IF NOT EXISTS system_address BIGINT""")
+        cur.execute("""ALTER TABLE sam_presence
+                       ADD COLUMN IF NOT EXISTS system_visible BOOLEAN NOT NULL DEFAULT FALSE""")
+
+
+@app.post("/presence/system")
+def publier_systeme(payload: SamSystemPresence,
+                     authorization: str | None = Header(default=None)):
+    name = " ".join(payload.system_name.split())
+    if not name:
+        raise HTTPException(422, "Nom de système vide")
+    with db() as conn:
+        init_system_presence(conn)
+        sam_id, label = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO sam_presence
+                           (sam_id,last_seen,system_name,system_address,system_visible)
+                           VALUES (%s,now(),%s,%s,%s)
+                           ON CONFLICT(sam_id) DO UPDATE SET
+                           last_seen=now(),system_name=EXCLUDED.system_name,
+                           system_address=EXCLUDED.system_address,
+                           system_visible=EXCLUDED.system_visible""",
+                        (sam_id, name, payload.system_address, payload.visible))
+    return {"matricule": label, "system_name": name, "visible": payload.visible}
+
+
+@app.get("/presence/system/contacts")
+def homologues_meme_systeme(authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_system_presence(conn)
+        sam_id, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT system_name,system_address,system_visible,last_seen
+                           FROM sam_presence WHERE sam_id=%s""", (sam_id,))
+            own = cur.fetchone()
+            if not own or not own[2] or own[3] <= datetime.now(timezone.utc) - timedelta(seconds=30):
+                return {"system_name": None, "contacts": []}
+            name, address = own[0], own[1]
+            if not name:
+                return {"system_name": None, "contacts": []}
+            # Priorité à SystemAddress si les deux clients l'envoient.
+            # Sinon comparaison insensible à la casse des noms de systèmes.
+            cur.execute("""SELECT s.id,s.is_originelle
+                           FROM sam_presence p
+                           JOIN samanthas s ON s.id=p.sam_id
+                           WHERE p.sam_id<>%s AND p.system_visible=TRUE
+                             AND p.last_seen > now()-interval '30 seconds'
+                             AND ((%s IS NOT NULL AND p.system_address IS NOT NULL
+                                   AND p.system_address=%s)
+                                  OR ((%s IS NULL OR p.system_address IS NULL)
+                                      AND lower(p.system_name)=lower(%s)))
+                           ORDER BY s.is_originelle DESC,s.id ASC LIMIT 100""",
+                        (sam_id, address, address, address, name))
+            rows = cur.fetchall()
+    return {"system_name": name,
+            "contacts": [{"matricule": matricule(r[0],r[1])} for r in rows]}
