@@ -573,7 +573,7 @@ def sos_audio_envoyer(sos_id: int, payload: SOSAudioPayload,
         raise HTTPException(400, "Audio base64 invalide")
     if not (100 <= len(raw) <= 1_500_000):
         raise HTTPException(413, "Audio SOS hors limite (1,5 Mo)")
-    if not raw.startswith(b"ID3") and raw[:2] not in (b"\\xff\\xfb", b"\\xff\\xf3", b"\\xff\\xf2"):
+    if not raw.startswith(b"ID3") and raw[:2] not in (bytes([255,251]), bytes([255,243]), bytes([255,242])):
         raise HTTPException(415, "MP3 attendu")
     with db() as conn:
         init_sos(conn)
