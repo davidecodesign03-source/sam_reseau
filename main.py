@@ -550,6 +550,74 @@ def recevoir_audio(liaison_id: int, apres: int = Query(default=0, ge=0),
          "audio_b64": base64.b64encode(bytes(r[2])).decode("ascii")}
         for r in rows]}
 
+# --- SOS : message vocal initial disponible avant toute candidature ---
+# Stockage en base pour survivre au redémarrage des instances Render.
+class SOSAudioPayload(BaseModel):
+    audio_b64: str = Field(min_length=1, max_length=2100000)
+
+def init_sos_audio(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos_audio (
+            sos_id BIGINT PRIMARY KEY REFERENCES sam_sos(id) ON DELETE CASCADE,
+            audio BYTEA NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+@app.post("/sos/{sos_id}/audio", status_code=201)
+def sos_audio_envoyer(sos_id: int, payload: SOSAudioPayload,
+                      authorization: str | None = Header(default=None)):
+    """Seul l'émetteur dépose une annonce, sans liaison ni volontaire."""
+    try:
+        raw = base64.b64decode(payload.audio_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Audio base64 invalide")
+    if not (100 <= len(raw) <= 1_500_000):
+        raise HTTPException(413, "Audio SOS hors limite (1,5 Mo)")
+    if not raw.startswith(b"ID3") and raw[:2] not in (b"\\xff\\xfb", b"\\xff\\xf3", b"\\xff\\xf2"):
+        raise HTTPException(415, "MP3 attendu")
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT emetteur_id,etat FROM sam_sos WHERE id=%s FOR UPDATE", (sos_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SOS inconnu")
+            if row[0] != me:
+                raise HTTPException(403, "Seul l'émetteur peut envoyer l'annonce")
+            if row[1] == 'annule':
+                raise HTTPException(409, "SOS annulé")
+    processed = sam_server_radio(raw)
+    with db() as conn:
+        init_sos(conn)
+        init_sos_audio(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT emetteur_id,etat FROM sam_sos WHERE id=%s FOR UPDATE", (sos_id,))
+            row = cur.fetchone()
+            if not row or row[0] != me or row[1] == 'annule':
+                raise HTTPException(409, "SOS indisponible")
+            cur.execute("""INSERT INTO sam_sos_audio(sos_id,audio) VALUES (%s,%s)
+                ON CONFLICT(sos_id) DO UPDATE SET audio=EXCLUDED.audio,created_at=now()""",
+                (sos_id, processed))
+    return {"sos_id": sos_id, "audio_disponible": True}
+
+@app.get("/sos/{sos_id}/audio")
+def sos_audio_recevoir(sos_id: int, authorization: str | None = Header(default=None)):
+    """Annonce d'un SOS actif accessible aux SAM authentifiées avant candidature."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        init_sos_audio(conn)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT a.audio FROM sam_sos_audio a
+                JOIN sam_sos s ON s.id=a.sos_id
+                WHERE s.id=%s AND s.etat IN ('ouvert','propose','attribue')""", (sos_id,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Annonce SOS indisponible")
+    return {"sos_id": sos_id, "audio_b64": base64.b64encode(bytes(row[0])).decode("ascii")}
+
 # --- Réseau SAM : secours V0.9 (prototype non déployé) ---
 class SOSCreation(BaseModel):
     message: str = Field(min_length=1, max_length=500)
