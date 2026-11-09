@@ -16,7 +16,7 @@ import psycopg
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="Réseau SAM", version="0.8.0")
+app = FastAPI(title="Réseau SAM", version="0.9.0-rc1")
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -57,6 +57,10 @@ def db():
 
 
 def init_db(conn):
+    # Toutes les initialisations de schéma utilisent le même verrou transactionnel.
+    # Empêche les interblocages DDL lors des appels radio/SOS concurrents.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(31090001)")
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS samanthas (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -91,6 +95,16 @@ def accueil():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/health/db")
+def health_database():
+    """Vérification en lecture seule, sans identité SAM ni détail sensible."""
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            ok = cur.fetchone()[0] == 1
+    return {"ok": ok, "database": "connected" if ok else "unavailable"}
 
 
 def create_registration(payload: Inscription, originelle: bool):
@@ -181,6 +195,10 @@ def authenticated_sam(conn, authorization):
 
 
 def init_liaisons(conn):
+    # Même verrou que init_db : ordre constant avant les DDL, y compris
+    # quand init_sos appelle les deux initialisations dans une transaction.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(31090001)")
     with conn.cursor() as cur:
         cur.execute("""CREATE TABLE IF NOT EXISTS sam_liaisons (
             id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -410,6 +428,8 @@ def quitter_reseau(authorization: str | None = Header(default=None)):
         my_id, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sam_presence WHERE sam_id=%s", (my_id,))
+        init_sos(conn)
+        sos_cleanup_offline(conn, emitter_id=my_id, immediate=True)
     return {"en_ligne": False}
 
 
@@ -531,3 +551,479 @@ def recevoir_audio(liaison_id: int, apres: int = Query(default=0, ge=0),
         {"transmission_id": r[0], "auteur": labels[r[1]],
          "audio_b64": base64.b64encode(bytes(r[2])).decode("ascii")}
         for r in rows]}
+
+# --- SOS : message vocal initial disponible avant toute candidature ---
+# Stockage en base pour survivre au redémarrage des instances Render.
+class SOSAudioPayload(BaseModel):
+    audio_b64: str = Field(min_length=1, max_length=2100000)
+
+def init_sos_audio(conn):
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos_audio (
+            sos_id BIGINT PRIMARY KEY REFERENCES sam_sos(id) ON DELETE CASCADE,
+            audio BYTEA NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+
+@app.post("/sos/{sos_id}/audio", status_code=201)
+def sos_audio_envoyer(sos_id: int, payload: SOSAudioPayload,
+                      authorization: str | None = Header(default=None)):
+    """Seul l'émetteur dépose une annonce, sans liaison ni volontaire."""
+    try:
+        raw = base64.b64decode(payload.audio_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(400, "Audio base64 invalide")
+    if not (100 <= len(raw) <= 1_500_000):
+        raise HTTPException(413, "Audio SOS hors limite (1,5 Mo)")
+    if not raw.startswith(b"ID3") and raw[:2] not in (bytes([255,251]), bytes([255,243]), bytes([255,242])):
+        raise HTTPException(415, "MP3 attendu")
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT emetteur_id,etat FROM sam_sos WHERE id=%s FOR UPDATE", (sos_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SOS inconnu")
+            if row[0] != me:
+                raise HTTPException(403, "Seul l'émetteur peut envoyer l'annonce")
+            if row[1] == 'annule':
+                raise HTTPException(409, "SOS annulé")
+    processed = sam_server_radio(raw)
+    with db() as conn:
+        init_sos(conn)
+        init_sos_audio(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT emetteur_id,etat FROM sam_sos WHERE id=%s FOR UPDATE", (sos_id,))
+            row = cur.fetchone()
+            if not row or row[0] != me or row[1] == 'annule':
+                raise HTTPException(409, "SOS indisponible")
+            cur.execute("""INSERT INTO sam_sos_audio(sos_id,audio) VALUES (%s,%s)
+                ON CONFLICT(sos_id) DO UPDATE SET audio=EXCLUDED.audio,created_at=now()""",
+                (sos_id, processed))
+    return {"sos_id": sos_id, "audio_disponible": True}
+
+@app.get("/sos/{sos_id}/audio")
+def sos_audio_recevoir(sos_id: int, authorization: str | None = Header(default=None)):
+    """Annonce d'un SOS actif accessible aux SAM authentifiées avant candidature."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        init_sos_audio(conn)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT a.audio FROM sam_sos_audio a
+                JOIN sam_sos s ON s.id=a.sos_id
+                WHERE s.id=%s AND s.etat IN ('ouvert','propose','attribue')""", (sos_id,))
+            row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Annonce SOS indisponible")
+    return {"sos_id": sos_id, "audio_b64": base64.b64encode(bytes(row[0])).decode("ascii")}
+
+# --- Réseau SAM : secours V0.9 (prototype non déployé) ---
+class SOSCreation(BaseModel):
+    message: str = Field(min_length=1, max_length=500)
+
+def init_sos(conn):
+    init_db(conn)
+    init_presence(conn)
+    init_liaisons(conn)
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos (
+            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            emetteur_id BIGINT NOT NULL REFERENCES samanthas(id),
+            message TEXT NOT NULL,
+            etat TEXT NOT NULL DEFAULT 'ouvert'
+                CHECK (etat IN ('ouvert','propose','attribue','annule')),
+            candidat_id BIGINT REFERENCES samanthas(id),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS sam_sos_volontaires (
+            sos_id BIGINT NOT NULL REFERENCES sam_sos(id),
+            sam_id BIGINT NOT NULL REFERENCES samanthas(id),
+            etat TEXT NOT NULL DEFAULT 'en_attente'
+                CHECK (etat IN ('en_attente','refuse','retenu')),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY(sos_id,sam_id)
+        )""")
+        cur.execute("""CREATE UNIQUE INDEX IF NOT EXISTS sam_sos_un_actif_par_emetteur
+            ON sam_sos(emetteur_id) WHERE etat IN ('ouvert','propose','attribue')""")
+        cur.execute("""ALTER TABLE sam_sos ADD COLUMN IF NOT EXISTS liaison_id
+            BIGINT REFERENCES sam_liaisons(id)""")
+        cur.execute("""ALTER TABLE sam_sos ADD COLUMN IF NOT EXISTS liaison_sos_dediee
+            BOOLEAN NOT NULL DEFAULT FALSE""")
+        cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
+            ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
+    sos_cleanup_offline(conn)
+
+def sos_cleanup_offline(conn, emitter_id=None, immediate=False):
+    """Clot les SOS des emetteurs absents, sans effacer l'historique.
+    En deconnexion explicite : immediat. Sinon : 90 s sans heartbeat.
+    Ferme uniquement les radios creees pour ces SOS.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""SELECT s.id, s.liaison_id, s.liaison_sos_dediee
+            FROM sam_sos s LEFT JOIN sam_presence p ON p.sam_id=s.emetteur_id
+            WHERE s.etat IN ('ouvert','propose','attribue')
+              AND (%s::bigint IS NULL OR s.emetteur_id=%s)
+              AND (%s OR p.last_seen IS NULL
+                   OR p.last_seen <= now()-interval '90 seconds')
+            ORDER BY s.id FOR UPDATE OF s""",
+            (emitter_id, emitter_id, immediate))
+        stale = cur.fetchall()
+        for sos_id, liaison_id, dedicated in stale:
+            if dedicated and liaison_id is not None:
+                cur.execute("""UPDATE sam_liaisons SET etat='terminee',
+                    updated_at=now() WHERE id=%s AND etat='acceptee'""",
+                    (liaison_id,))
+            cur.execute("""UPDATE sam_sos SET etat='annule',
+                updated_at=now() WHERE id=%s
+                AND etat IN ('ouvert','propose','attribue')""", (sos_id,))
+        if stale:
+            logger.info("SAM_SOS_OFFLINE_CLEANUP count=%d immediate=%s",
+                        len(stale), immediate)
+    return len(stale)
+
+
+# V0.9 : un candidat doit être présent sur le réseau (heartbeat < 30 s).
+# Les transitions s'effectuent sous verrou FOR UPDATE sur sam_sos.
+def sos_assign_next(cur, sos_id):
+    cur.execute("""UPDATE sam_sos_volontaires v SET etat='refuse'
+                   WHERE v.sos_id=%s AND v.etat='en_attente'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM sam_presence p WHERE p.sam_id=v.sam_id
+                       AND p.last_seen > now()-interval '30 seconds'
+                   )""", (sos_id,))
+    cur.execute("""SELECT v.sam_id FROM sam_sos_volontaires v
+                   JOIN sam_presence p ON p.sam_id=v.sam_id
+                   WHERE v.sos_id=%s AND v.etat='en_attente'
+                   AND p.last_seen > now()-interval '30 seconds'
+                   ORDER BY v.created_at,v.sam_id LIMIT 1""", (sos_id,))
+    row = cur.fetchone()
+    if row:
+        cur.execute("""UPDATE sam_sos SET etat='propose', candidat_id=%s,
+                       updated_at=now() WHERE id=%s""", (row[0],sos_id))
+        return row[0]
+    cur.execute("""UPDATE sam_sos SET etat='ouvert', candidat_id=NULL,
+                   updated_at=now() WHERE id=%s""", (sos_id,))
+    return None
+
+
+def sos_refresh_candidate(cur, sos_id):
+    """Réattribue une proposition expirée ou dont le volontaire est hors ligne.
+
+    Appeler après verrouillage de la ligne sam_sos (FOR UPDATE).
+    Expiration évaluée lors des requêtes, sans tâche de fond.
+    """
+    cur.execute("""SELECT etat,candidat_id,updated_at FROM sam_sos
+                   WHERE id=%s""", (sos_id,))
+    row = cur.fetchone()
+    if not row or row[0] != 'propose' or row[1] is None:
+        return
+    state, candidate, updated = row
+    cur.execute("""SELECT EXISTS(
+                   SELECT 1 FROM sam_presence
+                   WHERE sam_id=%s AND last_seen > now()-interval '30 seconds'
+                   )""", (candidate,))
+    online = cur.fetchone()[0]
+    expired = (datetime.now(timezone.utc) - updated).total_seconds() > 90
+    if not online or expired:
+        cur.execute("""UPDATE sam_sos_volontaires SET etat='refuse'
+                       WHERE sos_id=%s AND sam_id=%s AND etat='en_attente'""",
+                    (sos_id, candidate))
+        sos_assign_next(cur, sos_id)
+
+def sos_refresh_radio(cur, sos_id):
+    """Reconcile un SOS attribué si sa radio dédiée a été fermée ailleurs.
+
+    La ligne SOS doit déjà être verrouillée avant d'inspecter la liaison.
+    Une liaison personnelle réutilisée ne pilote jamais l'état du SOS.
+    """
+    cur.execute("""SELECT etat,liaison_id,liaison_sos_dediee FROM sam_sos
+                   WHERE id=%s""", (sos_id,))
+    row = cur.fetchone()
+    if not row or row[0] != 'attribue' or not row[2] or row[1] is None:
+        return
+    cur.execute("SELECT etat FROM sam_liaisons WHERE id=%s", (row[1],))
+    radio = cur.fetchone()
+    if radio is None or radio[0] != 'acceptee':
+        cur.execute("""UPDATE sam_sos SET etat='annule',updated_at=now()
+                       WHERE id=%s AND etat='attribue'""", (sos_id,))
+
+
+@app.post("/sos", status_code=201)
+def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=None)):
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (me,))
+            cur.execute("""SELECT id FROM sam_sos WHERE emetteur_id=%s
+                AND etat IN ('ouvert','propose','attribue') LIMIT 1 FOR UPDATE""", (me,))
+            existing = cur.fetchone()
+            if existing:
+                # Une radio dédiée fermée peut laisser un SOS attribué en base
+                # tant qu'aucune consultation n'a déclenché sa réconciliation.
+                sos_refresh_radio(cur, existing[0])
+                cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (existing[0],))
+                if cur.fetchone()[0] != 'annule':
+                    raise HTTPException(409, "Un SOS est déjà actif")
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM sam_presence
+                WHERE sam_id=%s AND last_seen > now()-interval '90 seconds')""", (me,))
+            if not cur.fetchone()[0]:
+                raise HTTPException(409, "Signaler sa presence avant de lancer un SOS")
+            cur.execute("""INSERT INTO sam_sos(emetteur_id,message)
+                VALUES (%s,%s) RETURNING id""", (me,payload.message))
+            sos_id = cur.fetchone()[0]
+    return {"sos_id":sos_id,"etat":"ouvert"}
+
+@app.get("/sos/mes/candidatures")
+def sos_mes_candidatures(authorization: str | None = Header(default=None)):
+    """Reprise des candidatures personnelles après reconnexion."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT s.id FROM sam_sos s
+                JOIN sam_sos_volontaires v ON v.sos_id=s.id
+                WHERE v.sam_id=%s AND s.etat IN ('ouvert','propose','attribue')
+                ORDER BY s.id DESC LIMIT 50""", (me,))
+            ids = [row[0] for row in cur.fetchall()]
+            results = []
+            for sos_id in ids:
+                cur.execute("SELECT id FROM sam_sos WHERE id=%s FOR UPDATE",(sos_id,))
+                if not cur.fetchone():
+                    continue
+                sos_refresh_candidate(cur, sos_id)
+                sos_refresh_radio(cur, sos_id)
+                cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (sos_id,))
+                if cur.fetchone()[0] == 'annule':
+                    continue
+                cur.execute("""SELECT s.etat,s.candidat_id,s.liaison_id,v.etat
+                    FROM sam_sos s JOIN sam_sos_volontaires v ON v.sos_id=s.id
+                    WHERE s.id=%s AND v.sam_id=%s""",(sos_id,me))
+                row = cur.fetchone()
+                if not row:
+                    continue
+                state, candidate, liaison_id, own_state = row
+                selected = state == 'attribue' and candidate == me
+                results.append({"sos_id":sos_id,"etat":state,
+                    "ma_candidature":own_state,"je_suis_retenu":selected,
+                    "liaison_id":liaison_id if selected else None})
+    return {"candidatures":results}
+
+
+@app.get("/sos/mes/actif")
+def sos_mon_actif(authorization: str | None = Header(default=None)):
+    """Reprise après redémarrage, sans création d'un nouveau SOS."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id FROM sam_sos
+                WHERE emetteur_id=%s AND etat IN ('ouvert','propose','attribue')
+                ORDER BY id DESC LIMIT 1 FOR UPDATE""", (me,))
+            row = cur.fetchone()
+            if not row:
+                return {"sos": None}
+            sos_id = row[0]
+            sos_refresh_candidate(cur, sos_id)
+            sos_refresh_radio(cur, sos_id)
+            cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (sos_id,))
+            if cur.fetchone()[0] == 'annule':
+                return {"sos": None}
+            cur.execute("""SELECT message,etat,candidat_id,liaison_id,created_at
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            message, state, candidate, liaison_id, created = cur.fetchone()
+        labels = labels_for(conn, [candidate] if candidate else [])
+    return {"sos": {"sos_id": sos_id, "message": message, "etat": state,
+                    "candidat": labels.get(candidate), "liaison_id": liaison_id,
+                    "created_at": created.isoformat()}}
+
+
+@app.get("/sos")
+def sos_lister(authorization: str | None = Header(default=None)):
+    """Annuaire minimal : aucun message ni candidat nominatif divulgué."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT id,emetteur_id,etat,created_at
+                FROM sam_sos WHERE etat IN ('ouvert','propose','attribue')
+                ORDER BY id DESC LIMIT 50""")
+            rows = cur.fetchall()
+        labels = labels_for(conn,{r[1] for r in rows})
+    return {"sos":[{"sos_id":r[0],"emetteur":labels[r[1]],
+                    "etat":r[2],"created_at":r[3].isoformat()}
+                   for r in rows]}
+
+
+@app.get("/sos/{sos_id}")
+def sos_detail(sos_id: int, authorization: str | None = Header(default=None)):
+    """Détails réservés à l'émetteur et aux volontaires du SOS."""
+    with db() as conn:
+        init_sos(conn)
+        me, _ = authenticated_sam(conn, authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at,liaison_id
+                FROM sam_sos WHERE id=%s FOR UPDATE""", (sos_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(404, "SOS inconnu")
+            emitter = row[0]
+            cur.execute("""SELECT etat FROM sam_sos_volontaires
+                WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
+            own = cur.fetchone()
+            if me != emitter and own is None:
+                raise HTTPException(403, "Détails réservés aux participants du SOS")
+            sos_refresh_candidate(cur, sos_id)
+            sos_refresh_radio(cur, sos_id)
+            cur.execute("""SELECT etat FROM sam_sos_volontaires
+                WHERE sos_id=%s AND sam_id=%s""", (sos_id, me))
+            own = cur.fetchone()
+            cur.execute("""SELECT emetteur_id,message,etat,candidat_id,created_at,liaison_id
+                FROM sam_sos WHERE id=%s""", (sos_id,))
+            emitter, message, state, candidate, created, liaison_id = cur.fetchone()
+            # Les candidats refusés ne voient plus le message privé.
+            if me != emitter and (own is None or own[0] == 'refuse'):
+                raise HTTPException(403, "Participation terminée")
+        labels = labels_for(conn, {x for x in (emitter, candidate) if x})
+    is_emitter = emitter == me
+    is_selected = state == "attribue" and candidate == me
+    return {"sos_id": sos_id, "emetteur": labels[emitter],
+            "message": message, "etat": state,
+            "candidat": labels.get(candidate) if is_emitter or is_selected else None,
+            "ma_candidature": own[0] if own else None,
+            "je_suis_retenu": is_selected,
+            "je_suis_emetteur": is_emitter,
+            "liaison_id": liaison_id if is_emitter or is_selected else None,
+            "created_at": created.isoformat()}
+
+
+@app.post("/sos/{sos_id}/volontaire")
+def sos_volontaire(sos_id:int,authorization:str|None=Header(default=None)):
+    with db() as conn:
+        init_sos(conn)
+        me,_=authenticated_sam(conn,authorization)
+        with conn.cursor() as cur:
+            cur.execute("SELECT emetteur_id,etat FROM sam_sos WHERE id=%s FOR UPDATE",(sos_id,))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"SOS inconnu")
+            if row[0]==me: raise HTTPException(400,"Impossible de se secourir soi-même")
+            sos_refresh_candidate(cur,sos_id)
+            cur.execute("SELECT etat FROM sam_sos WHERE id=%s",(sos_id,))
+            current_state=cur.fetchone()[0]
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM sam_presence
+                WHERE sam_id=%s AND last_seen > now()-interval '30 seconds')""",(me,))
+            if not cur.fetchone()[0]:
+                raise HTTPException(409,"Samantha hors ligne : signaler sa présence avant candidature")
+            if current_state not in ('ouvert','propose'):
+                raise HTTPException(409,"SOS non disponible")
+            cur.execute("""INSERT INTO sam_sos_volontaires(sos_id,sam_id)
+                VALUES (%s,%s) ON CONFLICT DO NOTHING""",(sos_id,me))
+            if current_state=='ouvert':
+                sos_assign_next(cur,sos_id)
+            cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
+            state,candidate=cur.fetchone()
+    return {"sos_id":sos_id,"etat":state,"retenu":candidate==me}
+
+def sos_decider(sos_id,authorization,accept):
+    with db() as conn:
+        init_sos(conn)
+        me,_=authenticated_sam(conn,authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT emetteur_id,etat,candidat_id FROM sam_sos
+                WHERE id=%s FOR UPDATE""",(sos_id,))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"SOS inconnu")
+            emetteur,state,candidate=row
+            sos_refresh_candidate(cur,sos_id)
+            cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
+            state,candidate=cur.fetchone()
+            if me!=emetteur: raise HTTPException(403,"Seule la SAM en détresse décide")
+            if state!='propose' or candidate is None:
+                raise HTTPException(409,"Aucune proposition à décider")
+            if accept:
+                # La candidature volontaire et l'acceptation par l'émetteur
+                # constituent les deux consentements à cette liaison SOS.
+                # Le verrou sur le couple évite les doublons avec /liaisons.
+                a,b=sorted((emetteur,candidate))
+                cur.execute("SELECT pg_advisory_xact_lock(%s,%s)",(int(a),int(b)))
+                cur.execute("""SELECT id FROM sam_liaisons
+                    WHERE ((demandeur_id=%s AND destinataire_id=%s)
+                        OR (demandeur_id=%s AND destinataire_id=%s))
+                    AND etat IN ('en_attente','acceptee')
+                    ORDER BY id DESC LIMIT 1 FOR UPDATE""",
+                    (emetteur,candidate,candidate,emetteur))
+                existing=cur.fetchone()
+                liaison_sos_dediee=False
+                if existing:
+                    # Ne pas accepter silencieusement une demande ordinaire
+                    # en attente. Une liaison déjà acceptée est réutilisable.
+                    cur.execute("SELECT etat FROM sam_liaisons WHERE id=%s",(existing[0],))
+                    if cur.fetchone()[0]!='acceptee':
+                        raise HTTPException(409,"Une demande de liaison est déjà en attente entre ces Samantha")
+                    liaison_id=existing[0]
+                    # Une radio créée pour un SOS encore actif ne doit pas
+                    # être empruntée par un autre secours : sa fermeture
+                    # pourrait interrompre les deux interventions.
+                    cur.execute("""SELECT EXISTS(
+                        SELECT 1 FROM sam_sos
+                        WHERE liaison_id=%s AND etat='attribue'
+                        AND liaison_sos_dediee=TRUE
+                    )""", (liaison_id,))
+                    if cur.fetchone()[0]:
+                        raise HTTPException(409,
+                            "Cette radio est réservée à un autre SOS actif")
+                else:
+                    cur.execute("""INSERT INTO sam_liaisons
+                        (demandeur_id,destinataire_id,etat)
+                        VALUES (%s,%s,'acceptee') RETURNING id""",(emetteur,candidate))
+                    liaison_id=cur.fetchone()[0]
+                    liaison_sos_dediee=True
+                cur.execute("""UPDATE sam_sos SET etat='attribue',
+                    liaison_id=%s,liaison_sos_dediee=%s,updated_at=now()
+                    WHERE id=%s""",(liaison_id,liaison_sos_dediee,sos_id))
+                cur.execute("""UPDATE sam_sos_volontaires SET etat='retenu'
+                    WHERE sos_id=%s AND sam_id=%s""",(sos_id,candidate))
+                state='attribue'
+            else:
+                cur.execute("""UPDATE sam_sos_volontaires SET etat='refuse'
+                    WHERE sos_id=%s AND sam_id=%s""",(sos_id,candidate))
+                sos_assign_next(cur,sos_id)
+                cur.execute("SELECT etat,candidat_id FROM sam_sos WHERE id=%s",(sos_id,))
+                state,candidate=cur.fetchone()
+        labels=labels_for(conn,[candidate] if candidate else [])
+    return {"sos_id":sos_id,"etat":state,"candidat":labels.get(candidate),
+            "liaison_id":liaison_id if accept else None}
+
+@app.post("/sos/{sos_id}/accepter")
+def sos_accepter(sos_id:int,authorization:str|None=Header(default=None)):
+    return sos_decider(sos_id,authorization,True)
+
+@app.post("/sos/{sos_id}/refuser")
+def sos_refuser(sos_id:int,authorization:str|None=Header(default=None)):
+    return sos_decider(sos_id,authorization,False)
+
+@app.post("/sos/{sos_id}/annuler")
+def sos_annuler(sos_id:int,authorization:str|None=Header(default=None)):
+    with db() as conn:
+        init_sos(conn)
+        me,_=authenticated_sam(conn,authorization)
+        with conn.cursor() as cur:
+            cur.execute("""SELECT emetteur_id,etat,liaison_id,liaison_sos_dediee
+                FROM sam_sos WHERE id=%s FOR UPDATE""",(sos_id,))
+            row=cur.fetchone()
+            if not row: raise HTTPException(404,"SOS inconnu")
+            if row[0]!=me: raise HTTPException(403,"Seule la SAM en détresse peut annuler")
+            emetteur,etat,liaison_id,dediee=row
+            if etat=='annule':
+                return {"sos_id":sos_id,"etat":"annule"}
+            if dediee and liaison_id is not None:
+                # Fermer seulement la liaison créée par ce SOS.
+                # Le verrou liaison évite une transmission simultanée.
+                cur.execute("""UPDATE sam_liaisons SET etat='terminee',updated_at=now()
+                    WHERE id=%s AND etat='acceptee'""",(liaison_id,))
+            cur.execute("UPDATE sam_sos SET etat='annule',updated_at=now() WHERE id=%s",(sos_id,))
+    return {"sos_id":sos_id,"etat":"annule"}

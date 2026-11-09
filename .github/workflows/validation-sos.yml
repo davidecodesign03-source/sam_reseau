@@ -1,0 +1,81 @@
+name: Validation prototype SOS
+
+on:
+  push:
+    branches:
+      - feature/sos-candidatures-v09
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  verifier:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: samtest
+          POSTGRES_PASSWORD: samtest_local_only
+          POSTGRES_DB: samtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U samtest -d samtest"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      SAM_TEST_DATABASE_URL: postgresql://samtest:samtest_local_only@localhost:5432/samtest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Installer les dependances
+        run: pip install -r requirements.txt
+      - name: Installer le moteur de tests
+        run: pip install pytest
+      - name: Installer le client HTTP de test
+        run: pip install "httpx>=0.27,<1"
+      - name: Executer les tests de securite SOS
+        run: python -m pytest -q tests/test_sos_contract.py tests/test_sos_integration.py tests/test_client_sos_v09.py tests/test_sos_intentions_v09.py tests/test_sos_confirmation_v09.py
+      - name: Verifier la syntaxe Python
+        run: python -m py_compile main.py client_sos_v09.py sos_intentions_v09.py sos_confirmation_v09.py
+      - name: Verifier les routes SOS
+        run: |
+          python - <<'PY'
+          from main import app
+          routes = {(r.path, tuple(sorted(r.methods))) for r in app.routes}
+          for path, method in [
+              ("/sos", "POST"),
+              ("/sos", "GET"),
+              ("/sos/{sos_id}", "GET"),
+              ("/sos/{sos_id}/volontaire", "POST"),
+              ("/sos/{sos_id}/accepter", "POST"),
+              ("/sos/{sos_id}/refuser", "POST"),
+              ("/sos/{sos_id}/annuler", "POST"),
+          ]:
+              assert any(p == path and method in methods for p, methods in routes), (path, method)
+          print("Syntaxe et routes SOS OK")
+          PY
+
+      - name: Verifier les protections SOS par analyse statique
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          source = Path("main.py").read_text(encoding="utf-8")
+          tree = ast.parse(source)
+          functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+          for name in ("sos_creer", "sos_lister", "sos_detail", "sos_volontaire", "sos_decider", "sos_annuler"):
+              assert name in functions, f"Fonction manquante: {name}"
+              body = ast.get_source_segment(source, functions[name])
+              assert "authenticated_sam" in body or name == "sos_decider", f"Authentification manquante: {name}"
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_volontaire"])
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_decider"])
+          assert "FOR UPDATE" in ast.get_source_segment(source, functions["sos_annuler"])
+          assert "PRIMARY KEY(sos_id,sam_id)" in source
+          print("Structure, authentification, verrous et anti-doublons SOS : OK")
+          PY
