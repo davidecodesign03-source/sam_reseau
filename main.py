@@ -428,6 +428,8 @@ def quitter_reseau(authorization: str | None = Header(default=None)):
         my_id, _ = authenticated_sam(conn, authorization)
         with conn.cursor() as cur:
             cur.execute("DELETE FROM sam_presence WHERE sam_id=%s", (my_id,))
+        init_sos(conn)
+        sos_cleanup_offline(conn, emitter_id=my_id, immediate=True)
     return {"en_ligne": False}
 
 
@@ -653,6 +655,36 @@ def init_sos(conn):
             BOOLEAN NOT NULL DEFAULT FALSE""")
         cur.execute("""CREATE INDEX IF NOT EXISTS sam_sos_volontaires_ordre
             ON sam_sos_volontaires(sos_id,created_at,sam_id)""")
+    sos_cleanup_offline(conn)
+
+def sos_cleanup_offline(conn, emitter_id=None, immediate=False):
+    """Clot les SOS des emetteurs absents, sans effacer l'historique.
+    En deconnexion explicite : immediat. Sinon : 90 s sans heartbeat.
+    Ferme uniquement les radios creees pour ces SOS.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""SELECT s.id, s.liaison_id, s.liaison_sos_dediee
+            FROM sam_sos s LEFT JOIN sam_presence p ON p.sam_id=s.emetteur_id
+            WHERE s.etat IN ('ouvert','propose','attribue')
+              AND (%s::bigint IS NULL OR s.emetteur_id=%s)
+              AND (%s OR p.last_seen IS NULL
+                   OR p.last_seen <= now()-interval '90 seconds')
+            ORDER BY s.id FOR UPDATE OF s""",
+            (emitter_id, emitter_id, immediate))
+        stale = cur.fetchall()
+        for sos_id, liaison_id, dedicated in stale:
+            if dedicated and liaison_id is not None:
+                cur.execute("""UPDATE sam_liaisons SET etat='terminee',
+                    updated_at=now() WHERE id=%s AND etat='acceptee'""",
+                    (liaison_id,))
+            cur.execute("""UPDATE sam_sos SET etat='annule',
+                updated_at=now() WHERE id=%s
+                AND etat IN ('ouvert','propose','attribue')""", (sos_id,))
+        if stale:
+            logger.info("SAM_SOS_OFFLINE_CLEANUP count=%d immediate=%s",
+                        len(stale), immediate)
+    return len(stale)
+
 
 # V0.9 : un candidat doit être présent sur le réseau (heartbeat < 30 s).
 # Les transitions s'effectuent sous verrou FOR UPDATE sur sam_sos.
@@ -737,6 +769,10 @@ def sos_creer(payload: SOSCreation, authorization: str | None = Header(default=N
                 cur.execute("SELECT etat FROM sam_sos WHERE id=%s", (existing[0],))
                 if cur.fetchone()[0] != 'annule':
                     raise HTTPException(409, "Un SOS est déjà actif")
+            cur.execute("""SELECT EXISTS(SELECT 1 FROM sam_presence
+                WHERE sam_id=%s AND last_seen > now()-interval '90 seconds')""", (me,))
+            if not cur.fetchone()[0]:
+                raise HTTPException(409, "Signaler sa presence avant de lancer un SOS")
             cur.execute("""INSERT INTO sam_sos(emetteur_id,message)
                 VALUES (%s,%s) RETURNING id""", (me,payload.message))
             sos_id = cur.fetchone()[0]
